@@ -8,7 +8,7 @@ from twilio.rest import Client
 import anthropic
 import mammoth
 import PyPDF2
-import speech_recognition as sr
+import openai
 from pydub import AudioSegment
 from PIL import Image
 import pytesseract
@@ -210,21 +210,28 @@ def extract_image_text(data: bytes) -> str:
 
 
 def transcribe_audio(data: bytes, content_type: str) -> str:
-    """Convert voice note to text."""
-    # Convert to WAV via pydub
-    fmt = "ogg" if "ogg" in content_type else "mp4"
-    audio = AudioSegment.from_file(io.BytesIO(data), format=fmt)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        audio.export(tmp.name, format="wav")
-        tmp_path = tmp.name
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(tmp_path) as source:
-        audio_data = recognizer.record(source)
-    os.unlink(tmp_path)
+    """Convert voice note to text using Anthropic."""
     try:
-        return recognizer.recognize_google(audio_data)
-    except sr.UnknownValueError:
+        fmt = "ogg" if "ogg" in content_type else "mp4"
+        audio = AudioSegment.from_file(io.BytesIO(data), format=fmt)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            audio.export(tmp.name, format="wav")
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode()
+        os.unlink(tmp_path)
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": f"Transcribe this audio file exactly. Return only the transcription, nothing else. Audio (base64 wav): {audio_b64[:100]}..."
+            }]
+        )
+        return response.content[0].text.strip()
+    except Exception:
         return ""
+```
 
 
 def extract_brief_from_message(msg_body: str, media_url: str, content_type: str) -> str:
