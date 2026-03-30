@@ -9,6 +9,7 @@ import mammoth
 import PyPDF2
 import io
 import base64
+import threading
 
 app = Flask(__name__)
 
@@ -87,6 +88,19 @@ Return exactly:
 ...caption with hashtags...
 
 No preamble. No notes. Just the script and caption."""
+
+
+def send_message(to, body):
+    try:
+        twilio_client.messages.create(from_=TWILIO_NUMBER, to=to, body=body)
+    except Exception as e:
+        print(f"Send error: {e}")
+
+
+def send_in_chunks(to, text):
+    chunks = [text[i:i+1500] for i in range(0, len(text), 1500)]
+    for chunk in chunks:
+        send_message(to, chunk)
 
 
 def download_media(media_url):
@@ -188,6 +202,46 @@ def format_for_whatsapp(raw):
     return out
 
 
+def process_brief(from_number, brief_text, extra_notes):
+    try:
+        import time
+
+        # Message 2 — after 20 seconds
+        def send_progress():
+            time.sleep(20)
+            send_message(from_number, "Still writing… almost there. ✍️")
+
+        t = threading.Thread(target=send_progress)
+        t.daemon = True
+        t.start()
+
+        raw = generate_script(brief_text, extra_notes)
+        formatted = format_for_whatsapp(raw)
+        user_state[from_number] = {"last_brief": brief_text, "last_script": raw}
+
+        # Split into chunks and send
+        script_match = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\]|$)', raw, re.IGNORECASE)
+        caption_match = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
+
+        script = script_match.group(1).strip() if script_match else raw.strip()
+        caption = caption_match.group(1).strip() if caption_match else ""
+
+        # Send script in chunks
+        script_text = "🎬 *REEL SCRIPT*\n─────────────────\n" + script
+        send_in_chunks(from_number, script_text)
+
+        # Send caption separately
+        if caption:
+            caption_text = "📝 *CAPTION*\n─────────────────\n" + caption
+            send_in_chunks(from_number, caption_text)
+
+        send_message(from_number, "_Reply *refine* to adjust, or send a new brief to start fresh._")
+
+    except Exception as e:
+        print(f"Processing error: {e}")
+        send_message(from_number, "Something went wrong generating your script. Please try again!")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     from_number = request.form.get("From", "")
@@ -204,10 +258,10 @@ def webhook():
             "Hey! I am Honey's script generator.\n\n"
             "Send me a brand brief and I'll write the reel script and caption in your voice.\n\n"
             "What I can read:\n"
-            "PDF files\n"
-            "Word docs\n"
-            "Images and screenshots\n"
-            "Plain text\n\n"
+            "📄 PDF files\n"
+            "📝 Word docs\n"
+            "🖼️ Images and screenshots\n"
+            "✍️ Plain text\n\n"
             "Just send it over!"
         )
         return Response(str(resp), mimetype="text/xml")
@@ -255,33 +309,23 @@ def webhook():
         resp.message("Send me a brand brief as text, PDF, Word doc, or image!")
         return Response(str(resp), mimetype="text/xml")
 
-    twilio_client.messages.create(
-        from_=TWILIO_NUMBER,
-        to=from_number,
-        body="Writing your script... give me 20 seconds."
-    )
-
     try:
         brief_text = extract_brief(msg_body, media_url, content_type)
         if not brief_text or len(brief_text) < 5:
             resp.message("Could not extract enough text. Please paste the brief as text or send a clearer PDF or Word doc.")
             return Response(str(resp), mimetype="text/xml")
-
-        raw = generate_script(brief_text, extra_notes)
-        formatted = format_for_whatsapp(raw)
-        user_state[from_number] = {"last_brief": brief_text, "last_script": raw}
-
-        if len(formatted) <= 1500:
-            resp.message(formatted)
-        else:
-            parts = formatted.split("📝 *CAPTION*")
-            twilio_client.messages.create(from_=TWILIO_NUMBER, to=from_number, body=parts[0].strip())
-            if len(parts) > 1:
-                resp.message("📝 *CAPTION*\n" + parts[1].strip())
-
     except Exception as e:
-        print(f"Error: {e}")
-        resp.message("Something went wrong. Try again or paste the brief as plain text.")
+        print(f"Extract error: {e}")
+        resp.message("Could not read that file. Please paste the brief as plain text.")
+        return Response(str(resp), mimetype="text/xml")
+
+    # Send message 1 immediately
+    resp.message("✍️ Writing your script… give me 30 seconds.")
+
+    # Process in background so webhook returns fast
+    thread = threading.Thread(target=process_brief, args=(from_number, brief_text, extra_notes))
+    thread.daemon = True
+    thread.start()
 
     return Response(str(resp), mimetype="text/xml")
 
