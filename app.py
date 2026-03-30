@@ -1,6 +1,5 @@
 import os
 import re
-import tempfile
 import requests
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
@@ -23,7 +22,7 @@ SYSTEM_PROMPT = """You are a script and caption writer for Honey Sheth — an In
 
 HONEY'S VOICE:
 - Warm, confident, visually descriptive. Luxury feels lived-in, never distant.
-- Real over perfect. "I noticed" and "it feels like" — not "it transformed my skin."
+- Real over perfect. "I noticed" and "it feels like" not "it transformed my skin."
 - Each piece reads like a small story: sensory, honest, reflective.
 - She code-switches into Hindi naturally — never forced, only when emotion calls for it.
 - Calm confidence. Never hype. The product earns its place in the story.
@@ -122,7 +121,7 @@ def extract_brief(msg_body, media_url, content_type):
             img_b64 = base64.b64encode(data).decode()
             return f"[IMAGE:{img_b64}:{ct}]"
         elif "audio" in ct or "ogg" in ct:
-            return f"[AUDIO_NOTE: User sent a voice note. Ask them to type or send the brief as text or PDF instead.]"
+            return "[AUDIO]"
     return msg_body.strip()
 
 
@@ -148,13 +147,13 @@ def generate_script(brief_text, extra_notes=""):
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": ct, "data": img_b64}},
-                    {"type": "text", "text": f"This is a brand brief image. Extract all info and write a full Instagram reel script and caption in Honey Sheth's voice.\n{extra_notes}"}
+                    {"type": "text", "text": "This is a brand brief image. Extract all info and write a full Instagram reel script and caption in Honey Sheth's voice."}
                 ]
             }]
         else:
-            return "Sorry, couldn't read that image. Please send as text, PDF, or Word doc."
-    elif brief_text.startswith("[AUDIO_NOTE:"):
-        return "I can't process voice notes right now — could you type the brief or send it as a PDF or Word doc? That works perfectly!"
+            return "Sorry, could not read that image. Please send as text, PDF, or Word doc."
+    elif brief_text == "[AUDIO]":
+        return "I cannot process voice notes right now. Please type the brief or send it as a PDF or Word doc!"
     else:
         fmt = detect_format(brief_text)
         prompt = f"""Write a full Instagram reel script and caption.
@@ -165,7 +164,7 @@ CONTENT FORMAT: {fmt}
 BRAND BRIEF:
 {brief_text}
 
-Follow the emotional arc. Include the sensory/texture moment. Keep CTA soft. Caption should be a different angle from the script — quieter, more reflective."""
+Follow the emotional arc. Include the sensory texture moment. Keep CTA soft. Caption should be a different angle from the script."""
         messages = [{"role": "user", "content": prompt}]
 
     response = anthropic_client.messages.create(
@@ -202,26 +201,26 @@ def webhook():
 
     if lower in ["hi", "hello", "hey", "start"]:
         resp.message(
-            "👋 Hey! I'm Honey's script generator.\n\n"
-            "Send me a brand brief and I'll write the reel script + caption in your voice.\n\n"
-            "*What I can read:*\n"
-            "📄 PDF files\n"
-            "📝 Word docs (.docx)\n"
-            "🖼️ Images / screenshots\n"
-            "✍️ Plain text\n\n"
+            "Hey! I am Honey's script generator.\n\n"
+            "Send me a brand brief and I'll write the reel script and caption in your voice.\n\n"
+            "What I can read:\n"
+            "PDF files\n"
+            "Word docs\n"
+            "Images and screenshots\n"
+            "Plain text\n\n"
             "Just send it over!"
         )
         return Response(str(resp), mimetype="text/xml")
 
     if lower == "help":
         resp.message(
-            "*Commands:*\n"
-            "• Send any brief → script + caption\n"
-            "• *refine* → adjust the last script\n"
-            "• *immbt* → force IMMBT format\n"
-            "• *event* → force event format\n"
-            "• *collab* → force collab format\n"
-            "• *hi* → restart"
+            "Commands:\n"
+            "Send any brief to get script and caption\n"
+            "Reply refine to adjust the last script\n"
+            "Start message with immbt to force IMMBT format\n"
+            "Start with event to force event format\n"
+            "Start with collab to force collab format\n"
+            "Send hi to restart"
         )
         return Response(str(resp), mimetype="text/xml")
 
@@ -230,7 +229,7 @@ def webhook():
         extra_notes = "FORMAT: Instagram Made Me Buy This (IMMBT)"
         msg_body = msg_body[5:].strip()
     elif lower.startswith("event"):
-        extra_notes = "FORMAT: Event coverage — vlog-style"
+        extra_notes = "FORMAT: Event coverage vlog-style"
         msg_body = msg_body[5:].strip()
     elif lower.startswith("collab"):
         extra_notes = "FORMAT: Brand collaboration"
@@ -243,7 +242,7 @@ def webhook():
         if not last_brief:
             resp.message("No previous script found. Send a brief to get started!")
             return Response(str(resp), mimetype="text/xml")
-        resp.message("What would you like to change? e.g. 'make the hook more personal' or 'try a more playful tone'")
+        resp.message("What would you like to change? For example: make the hook more personal, or try a more playful tone.")
         user_state[from_number] = {**state, "awaiting_refine": True}
         return Response(str(resp), mimetype="text/xml")
 
@@ -253,19 +252,19 @@ def webhook():
         user_state[from_number] = {**state, "awaiting_refine": False}
 
     if not msg_body and not media_url:
-        resp.message("Send me a brand brief — as text, PDF, Word doc, or image!")
+        resp.message("Send me a brand brief as text, PDF, Word doc, or image!")
         return Response(str(resp), mimetype="text/xml")
 
     twilio_client.messages.create(
         from_=TWILIO_NUMBER,
         to=from_number,
-        body="✍️ Writing your script… give me 20 seconds."
+        body="Writing your script... give me 20 seconds."
     )
 
     try:
         brief_text = extract_brief(msg_body, media_url, content_type)
         if not brief_text or len(brief_text) < 5:
-            resp.message("I couldn't extract enough text. Please paste the brief as text, or send a clearer PDF or Word doc.")
+            resp.message("Could not extract enough text. Please paste the brief as text or send a clearer PDF or Word doc.")
             return Response(str(resp), mimetype="text/xml")
 
         raw = generate_script(brief_text, extra_notes)
@@ -282,7 +281,7 @@ def webhook():
 
     except Exception as e:
         print(f"Error: {e}")
-        resp.message("Something went wrong. Try again, or paste the brief as plain text.")
+        resp.message("Something went wrong. Try again or paste the brief as plain text.")
 
     return Response(str(resp), mimetype="text/xml")
 
@@ -295,4 +294,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-```
