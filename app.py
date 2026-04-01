@@ -12,12 +12,14 @@ import base64
 import threading
 import time
 import shelve
+import tempfile
 
 app = Flask(__name__)
 
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 twilio_client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
 TWILIO_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 state_lock = threading.Lock()
 
@@ -83,7 +85,6 @@ STORY SCRIPT RULES:
 - Much shorter than the reel script — 30 seconds max
 - Casual, direct, like talking to a close friend
 - References the reel without repeating it — drives curiosity to watch
-- Can use: talking to camera, product close-up, quick demo
 - Ends with a swipe up / link in bio CTA or "watch the reel"
 
 HONEY'S RULES:
@@ -204,6 +205,48 @@ def download_media(media_url):
     return r.content
 
 
+def transcribe_audio(data, content_type):
+    """Transcribe audio using Groq Whisper API."""
+    try:
+        # Determine file extension
+        if "ogg" in content_type:
+            ext = ".ogg"
+        elif "mp4" in content_type or "m4a" in content_type:
+            ext = ".m4a"
+        elif "mpeg" in content_type or "mp3" in content_type:
+            ext = ".mp3"
+        elif "webm" in content_type:
+            ext = ".webm"
+        else:
+            ext = ".ogg"
+
+        # Write to temp file
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        # Send to Groq Whisper
+        with open(tmp_path, "rb") as audio_file:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": (f"audio{ext}", audio_file, content_type)},
+                data={"model": "whisper-large-v3", "language": "en"}
+            )
+
+        os.unlink(tmp_path)
+
+        if response.status_code == 200:
+            return response.json().get("text", "").strip()
+        else:
+            print(f"Groq error: {response.text}")
+            return ""
+
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return ""
+
+
 def extract_pdf(data):
     reader = PyPDF2.PdfReader(io.BytesIO(data))
     return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
@@ -215,7 +258,7 @@ def extract_docx(data):
 
 
 def extract_email_brief(email_text):
-    """Use Claude to extract the key brief info from a forwarded brand email."""
+    """Extract key brief info from a forwarded brand email."""
     prompt = f"""This is a forwarded brand email. Extract only the relevant brief information for a content creator.
 
 Return exactly this format:
@@ -240,19 +283,21 @@ No preamble. Just the extracted brief."""
 
 
 def extract_brief(msg_body, media_url, content_type):
+    """Extract brief from any input type."""
     if media_url:
         data = download_media(media_url)
         ct = content_type.lower()
         if "pdf" in ct:
-            return extract_pdf(data)
+            return extract_pdf(data), False
         elif "word" in ct or "docx" in ct or "officedocument" in ct:
-            return extract_docx(data)
+            return extract_docx(data), False
         elif "image" in ct:
             img_b64 = base64.b64encode(data).decode()
-            return f"[IMAGE:{img_b64}:{ct}]"
-        elif "audio" in ct or "ogg" in ct:
-            return "[AUDIO]"
-    return msg_body.strip()
+            return f"[IMAGE:{img_b64}:{ct}]", False
+        elif "audio" in ct or "ogg" in ct or "mpeg" in ct or "mp4" in ct or "webm" in ct:
+            transcribed = transcribe_audio(data, ct)
+            return transcribed, True  # True = came from voice note
+    return msg_body.strip(), False
 
 
 def looks_like_email(text):
@@ -277,7 +322,7 @@ CONTENT FORMAT: {format_label}
 BRAND BRIEF:
 {brief_text}
 
-Each concept should have a different angle, hook, or emotional approach. Think about what would feel most authentic to Honey's voice.
+Each concept should have a different angle, hook, or emotional approach.
 
 Return EXACTLY this format:
 
@@ -305,12 +350,11 @@ No preamble. No notes. Just the 4 concepts."""
 
 
 def generate_script(brief_text, format_label, concept=None, extra_notes="", count=1):
-    """Generate full script + caption + story. If count > 1, generate multiple variations."""
+    """Generate full script + caption + story."""
     concept_line = f"\nCHOSEN CONCEPT TO EXECUTE:\n{concept}\n" if concept else ""
 
     if count > 1:
-        # Multiple script variations
-        prompt = f"""Write {count} distinct Instagram reel script variations for Honey Sheth, each with a different angle or hook. Each must have its own reel script, caption, and story script.
+        prompt = f"""Write {count} distinct Instagram reel script variations for Honey Sheth, each with a different angle or hook.
 
 CONTENT FORMAT: {format_label}
 {concept_line}
@@ -337,7 +381,7 @@ VARIATION 2
 [STORY SCRIPT]
 ...story...
 
-And so on. No preamble. No notes."""
+No preamble. No notes."""
 
         messages = [{"role": "user", "content": prompt}]
         response = anthropic_client.messages.create(
@@ -362,8 +406,6 @@ And so on. No preamble. No notes."""
             }]
         else:
             return None, None, None, "Sorry, could not read that image. Please send as text, PDF, or Word doc."
-    elif brief_text == "[AUDIO]":
-        return None, None, None, "I cannot process voice notes right now. Please type the brief or send as PDF or Word doc."
     else:
         prompt = f"""Write a full Instagram reel script, caption, and companion story script.
 
@@ -374,7 +416,7 @@ CONTENT FORMAT: {format_label}
 BRAND BRIEF:
 {brief_text}
 
-Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle. Story script should be short, casual, and drive curiosity to watch the reel."""
+Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle. Story script should be short, casual, drive curiosity to watch the reel."""
         messages = [{"role": "user", "content": prompt}]
 
     response = anthropic_client.messages.create(
@@ -442,7 +484,7 @@ def send_script_and_caption(to, script, caption, story=None, multiple_raw=None):
             time.sleep(0.5)
     send_message(to,
         "─────────────────\n"
-        "Reply with feedback to refine\n"
+        "Reply with feedback to refine — text or voice note\n"
         "Or send a new brief to start fresh."
     )
 
@@ -536,6 +578,19 @@ def process_refine_and_send(from_number, instruction):
     send_script_and_caption(from_number, script, caption, story)
 
 
+def process_voice_brief_and_send(from_number, transcribed_text):
+    """Handle a voice note sent as a brief — go straight to format selection."""
+    state = get_state(from_number)
+    set_state(from_number, {
+        **state,
+        "step": "awaiting_format",
+        "brief": transcribed_text,
+        "last_script": state.get("last_script", ""),
+        "last_caption": state.get("last_caption", "")
+    })
+    send_message(from_number, f"🎤 Got your voice brief! Here's what I heard:\n\n_{transcribed_text}_\n\n" + FORMAT_MENU)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     from_number  = request.form.get("From", "")
@@ -549,6 +604,34 @@ def webhook():
     state = get_state(from_number)
     step  = state.get("step", "idle")
 
+    # Handle voice notes first — before any other logic
+    if media_url and content_type and any(x in content_type.lower() for x in ["audio", "ogg", "mpeg", "mp4", "webm"]):
+        resp.message("🎤 Transcribing your voice note…")
+
+        def handle_voice():
+            data = download_media(media_url)
+            transcribed = transcribe_audio(data, content_type.lower())
+
+            if not transcribed or len(transcribed) < 3:
+                send_message(from_number, "Couldn't make out what you said. Could you type it out or try again?")
+                return
+
+            current_step = get_state(from_number).get("step", "idle")
+            current_state = get_state(from_number)
+
+            # If waiting for refinement or has a previous script — treat as feedback
+            if current_step == "awaiting_refine" or (current_step == "idle" and current_state.get("last_script")):
+                send_message(from_number, f"🎤 Got your feedback:\n\n_{transcribed}_\n\nRefining now… give me 30 seconds.")
+                process_refine_and_send(from_number, transcribed)
+            else:
+                # Treat as a new brief
+                process_voice_brief_and_send(from_number, transcribed)
+
+        thread = threading.Thread(target=handle_voice)
+        thread.daemon = True
+        thread.start()
+        return Response(str(resp), mimetype="text/xml")
+
     # Global commands
     if is_greeting(msg_body) and not media_url:
         set_state(from_number, {"step": "idle"})
@@ -560,6 +643,7 @@ def webhook():
             "📝 Word docs\n"
             "🖼️ Images / screenshots\n"
             "📧 Forwarded brand emails\n"
+            "🎤 Voice notes\n"
             "✍️ Plain text\n\n"
             "Just send it over!"
         )
@@ -568,16 +652,13 @@ def webhook():
     if lower == "help":
         resp.message(
             "*How it works:*\n"
-            "1. Send brief / forward email\n"
+            "1. Send brief / forward email / voice note\n"
             "2. Choose format (1/2/3)\n"
             "3. Choose sub-format\n"
             "4. Pick a concept (1/2/3/4)\n"
             "5. Get reel script + caption + story\n"
-            "6. Reply with feedback to refine\n\n"
-            "*Commands:*\n"
-            "hi — restart\n"
-            "help — this menu\n"
-            "cancel — start over"
+            "6. Reply with feedback (text or voice) to refine\n\n"
+            "*Commands:* hi, help, cancel"
         )
         return Response(str(resp), mimetype="text/xml")
 
@@ -619,7 +700,6 @@ def webhook():
         brief_text = state.get("brief", "")
         format_label = state.get("subformat_label", "")
 
-        # Write all 4
         if lower == "all":
             set_state(from_number, {**state, "step": "generating"})
             resp.message("Writing all 4 variations… give me 60 seconds ✍️")
@@ -630,7 +710,7 @@ def webhook():
 
         valid = [str(i) for i in range(1, len(concepts) + 1)]
         if lower not in valid:
-            resp.message(f"Please reply with 1, 2, 3, or 4 — or reply *all* to get all variations.")
+            resp.message("Please reply with 1, 2, 3, or 4 — or reply *all* to get all variations.")
             return Response(str(resp), mimetype="text/xml")
 
         chosen_concept = concepts[int(lower) - 1]
@@ -644,7 +724,7 @@ def webhook():
     # Awaiting refine instruction
     if step == "awaiting_refine":
         if not msg_body:
-            resp.message("What would you like to change?")
+            resp.message("What would you like to change? Type or send a voice note.")
             return Response(str(resp), mimetype="text/xml")
         set_state(from_number, {**state, "step": "generating"})
         resp.message("✍️ Refining… give me 30 seconds.")
@@ -659,17 +739,18 @@ def webhook():
             set_state(from_number, {**state, "step": "awaiting_refine"})
             resp.message(
                 "Sounds like feedback on your last script!\n\n"
-                "Reply with what you'd like to change — or send *cancel* to start fresh."
+                "Reply with what you'd like to change — text or voice note.\n"
+                "Or send *cancel* to start fresh."
             )
             return Response(str(resp), mimetype="text/xml")
 
     # New brief
     if not msg_body and not media_url:
-        resp.message("Send me a brand brief — as text, PDF, Word doc, image, or forward a brand email!")
+        resp.message("Send me a brand brief — text, PDF, Word doc, image, or voice note!")
         return Response(str(resp), mimetype="text/xml")
 
     try:
-        brief_text = extract_brief(msg_body, media_url, content_type)
+        brief_text, from_voice = extract_brief(msg_body, media_url, content_type)
     except Exception as e:
         print(f"Extract error: {e}")
         resp.message("Could not read that file. Please paste the brief as plain text.")
@@ -679,11 +760,7 @@ def webhook():
         resp.message("Could not extract enough text. Please paste as text or send a clearer file.")
         return Response(str(resp), mimetype="text/xml")
 
-    if brief_text == "[AUDIO]":
-        resp.message("I cannot process voice notes right now. Please type the brief or send as PDF or Word doc.")
-        return Response(str(resp), mimetype="text/xml")
-
-    # Check if it's a forwarded email — extract the brief first
+    # Check if it's a forwarded email
     if looks_like_email(brief_text) and not media_url:
         resp.message("📧 Looks like a brand email! Extracting the brief… one moment.")
         try:
