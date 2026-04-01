@@ -367,7 +367,7 @@ def webhook():
     step  = state.get("step", "idle")
 
     # Global commands
-    if lower in ["hi", "hello", "hey", "start"]:
+if any(lower.startswith(w) for w in ["hi", "hello", "hey", "start"]):
         set_state(from_number, {"step": "idle"})
         resp.message(
             "👋 Hey! I'm Honey's script generator.\n\n"
