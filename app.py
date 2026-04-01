@@ -81,12 +81,6 @@ COLLAB HAUL: One editorial hook holds everything together.
 COLLAB GIFTING: Relationship narrative first. Product is the act of care.
 COLLAB PLATFORM: Platform is the brand. Products are editorial picks within it.
 
-STORY SCRIPT RULES:
-- Much shorter than the reel script — 30 seconds max
-- Casual, direct, like talking to a close friend
-- References the reel without repeating it — drives curiosity to watch
-- Ends with a swipe up / link in bio CTA or "watch the reel"
-
 HONEY'S RULES:
 ALWAYS: Connect product to a real moment. Include texture moment. Give emotional way in before selling. Captions add something the video does not say.
 NEVER: Overclaim. Dump all benefits. Hard sell CTA. Caption as video transcript.
@@ -109,10 +103,7 @@ OUTPUT FORMAT — STRICT:
 [CAPTION]
 ...caption with hashtags...
 
-[STORY SCRIPT]
-...companion story script...
-
-No preamble. No notes. Just the three sections."""
+No preamble. No notes. Just the two sections."""
 
 FORMAT_MENU = (
     "What format is this for?\n\n"
@@ -206,9 +197,7 @@ def download_media(media_url):
 
 
 def transcribe_audio(data, content_type):
-    """Transcribe audio using Groq Whisper API."""
     try:
-        # Determine file extension
         if "ogg" in content_type:
             ext = ".ogg"
         elif "mp4" in content_type or "m4a" in content_type:
@@ -220,12 +209,10 @@ def transcribe_audio(data, content_type):
         else:
             ext = ".ogg"
 
-        # Write to temp file
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(data)
             tmp_path = tmp.name
 
-        # Send to Groq Whisper
         with open(tmp_path, "rb") as audio_file:
             response = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -237,7 +224,9 @@ def transcribe_audio(data, content_type):
         os.unlink(tmp_path)
 
         if response.status_code == 200:
-            return response.json().get("text", "").strip()
+            result = response.json().get("text", "").strip()
+            print(f"Transcription: '{result}'")
+            return result
         else:
             print(f"Groq error: {response.text}")
             return ""
@@ -258,7 +247,6 @@ def extract_docx(data):
 
 
 def extract_email_brief(email_text):
-    """Extract key brief info from a forwarded brand email."""
     prompt = f"""This is a forwarded brand email. Extract only the relevant brief information for a content creator.
 
 Return exactly this format:
@@ -283,7 +271,6 @@ No preamble. Just the extracted brief."""
 
 
 def extract_brief(msg_body, media_url, content_type):
-    """Extract brief from any input type."""
     if media_url:
         data = download_media(media_url)
         ct = content_type.lower()
@@ -294,14 +281,10 @@ def extract_brief(msg_body, media_url, content_type):
         elif "image" in ct:
             img_b64 = base64.b64encode(data).decode()
             return f"[IMAGE:{img_b64}:{ct}]", False
-        elif "audio" in ct or "ogg" in ct or "mpeg" in ct or "mp4" in ct or "webm" in ct:
-            transcribed = transcribe_audio(data, ct)
-            return transcribed, True  # True = came from voice note
     return msg_body.strip(), False
 
 
 def looks_like_email(text):
-    """Detect if the message looks like a forwarded brand email."""
     email_signals = [
         "from:", "subject:", "dear honey", "hi honey", "hello honey",
         "we would like", "we are reaching out", "collaboration",
@@ -314,7 +297,6 @@ def looks_like_email(text):
 
 
 def generate_concepts(brief_text, format_label):
-    """Generate 4 creative concept ideas."""
     prompt = f"""Based on this brand brief, generate 4 distinct creative concepts for an Instagram reel by Honey Sheth.
 
 CONTENT FORMAT: {format_label}
@@ -350,7 +332,6 @@ No preamble. No notes. Just the 4 concepts."""
 
 
 def generate_script(brief_text, format_label, concept=None, extra_notes="", count=1):
-    """Generate full script + caption + story."""
     concept_line = f"\nCHOSEN CONCEPT TO EXECUTE:\n{concept}\n" if concept else ""
 
     if count > 1:
@@ -370,16 +351,12 @@ VARIATION 1
 ...script...
 [CAPTION]
 ...caption...
-[STORY SCRIPT]
-...story...
 
 VARIATION 2
 [REEL SCRIPT]
 ...script...
 [CAPTION]
 ...caption...
-[STORY SCRIPT]
-...story...
 
 No preamble. No notes."""
 
@@ -390,9 +367,8 @@ No preamble. No notes."""
             system=SYSTEM_PROMPT,
             messages=messages
         )
-        return response.content[0].text.strip(), None, None, None
+        return response.content[0].text.strip(), None, None
 
-    # Single script
     if brief_text.startswith("[IMAGE:"):
         match = re.match(r'\[IMAGE:(.+):(.+)\]', brief_text)
         if match:
@@ -401,13 +377,13 @@ No preamble. No notes."""
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": ct, "data": img_b64}},
-                    {"type": "text", "text": f"This is a brand brief image. Extract all info.\n\nCONTENT FORMAT: {format_label}\n{concept_line}\n{extra_notes}\n\nWrite a full Instagram reel script, caption, and story script in Honey Sheth's voice."}
+                    {"type": "text", "text": f"This is a brand brief image. Extract all info.\n\nCONTENT FORMAT: {format_label}\n{concept_line}\n{extra_notes}\n\nWrite a full Instagram reel script and caption in Honey Sheth's voice."}
                 ]
             }]
         else:
-            return None, None, None, "Sorry, could not read that image. Please send as text, PDF, or Word doc."
+            return None, None, "Sorry, could not read that image. Please send as text, PDF, or Word doc."
     else:
-        prompt = f"""Write a full Instagram reel script, caption, and companion story script.
+        prompt = f"""Write a full Instagram reel script and caption.
 
 CONTENT FORMAT: {format_label}
 {concept_line}
@@ -416,23 +392,21 @@ CONTENT FORMAT: {format_label}
 BRAND BRIEF:
 {brief_text}
 
-Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle. Story script should be short, casual, drive curiosity to watch the reel."""
+Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle — quieter, more reflective."""
         messages = [{"role": "user", "content": prompt}]
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2800,
+        max_tokens=2200,
         system=SYSTEM_PROMPT,
         messages=messages
     )
     raw = response.content[0].text
     sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\]|$)', raw, re.IGNORECASE)
-    cm = re.search(r'\[CAPTION\]([\s\S]*?)(?=\[STORY SCRIPT\]|$)', raw, re.IGNORECASE)
-    stm = re.search(r'\[STORY SCRIPT\]([\s\S]*?)$', raw, re.IGNORECASE)
+    cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
     script = sm.group(1).strip() if sm else raw.strip()
     caption = cm.group(1).strip() if cm else ""
-    story = stm.group(1).strip() if stm else ""
-    return script, caption, story, None
+    return script, caption, None
 
 
 def refine_script(brief_text, format_label, last_script, last_caption, instruction):
@@ -452,25 +426,23 @@ PREVIOUS CAPTION:
 REFINEMENT REQUEST:
 {instruction}
 
-Rewrite incorporating this feedback. Keep everything that worked. Only change what was asked. Stay in Honey's voice. Return the full reel script, caption, and story script."""
+Rewrite incorporating this feedback. Keep everything that worked. Only change what was asked. Stay in Honey's voice."""
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2800,
+        max_tokens=2200,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.content[0].text
     sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\]|$)', raw, re.IGNORECASE)
-    cm = re.search(r'\[CAPTION\]([\s\S]*?)(?=\[STORY SCRIPT\]|$)', raw, re.IGNORECASE)
-    stm = re.search(r'\[STORY SCRIPT\]([\s\S]*?)$', raw, re.IGNORECASE)
+    cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
     script = sm.group(1).strip() if sm else raw.strip()
     caption = cm.group(1).strip() if cm else ""
-    story = stm.group(1).strip() if stm else ""
-    return script, caption, story
+    return script, caption
 
 
-def send_script_and_caption(to, script, caption, story=None, multiple_raw=None):
+def send_script_and_caption(to, script, caption, multiple_raw=None):
     if multiple_raw:
         send_in_chunks(to, multiple_raw)
     else:
@@ -478,9 +450,6 @@ def send_script_and_caption(to, script, caption, story=None, multiple_raw=None):
         time.sleep(1)
         if caption:
             send_in_chunks(to, "📝 *CAPTION*\n─────────────────\n" + caption)
-            time.sleep(0.5)
-        if story:
-            send_in_chunks(to, "📱 *STORY SCRIPT*\n─────────────────\n" + story)
             time.sleep(0.5)
     send_message(to,
         "─────────────────\n"
@@ -537,20 +506,20 @@ def process_and_send(from_number, brief_text, format_label, concept=None, extra_
     t.start()
 
     if count > 1:
-        raw_multiple, _, _, _ = generate_script(brief_text, format_label, concept, extra_notes, count=count)
+        raw_multiple, _, _ = generate_script(brief_text, format_label, concept, extra_notes, count=count)
         done["value"] = True
         state = get_state(from_number)
         set_state(from_number, {**state, "last_script": raw_multiple, "last_caption": "", "step": "idle"})
         send_script_and_caption(from_number, None, None, multiple_raw=raw_multiple)
     else:
-        script, caption, story, error = generate_script(brief_text, format_label, concept, extra_notes)
+        script, caption, error = generate_script(brief_text, format_label, concept, extra_notes)
         done["value"] = True
         if error:
             send_message(from_number, error)
             return
         state = get_state(from_number)
-        set_state(from_number, {**state, "last_script": script, "last_caption": caption, "last_story": story, "step": "idle"})
-        send_script_and_caption(from_number, script, caption, story)
+        set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
+        send_script_and_caption(from_number, script, caption)
 
 
 def process_refine_and_send(from_number, instruction):
@@ -571,15 +540,14 @@ def process_refine_and_send(from_number, instruction):
     t.daemon = True
     t.start()
 
-    script, caption, story = refine_script(brief_text, format_label, last_script, last_caption, instruction)
+    script, caption = refine_script(brief_text, format_label, last_script, last_caption, instruction)
     done["value"] = True
-    set_state(from_number, {**state, "last_script": script, "last_caption": caption, "last_story": story, "step": "idle"})
+    set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
     send_message(from_number, "Here's your refined version:")
-    send_script_and_caption(from_number, script, caption, story)
+    send_script_and_caption(from_number, script, caption)
 
 
 def process_voice_brief_and_send(from_number, transcribed_text):
-    """Handle a voice note sent as a brief — go straight to format selection."""
     state = get_state(from_number)
     set_state(from_number, {
         **state,
@@ -604,28 +572,37 @@ def webhook():
     state = get_state(from_number)
     step  = state.get("step", "idle")
 
-    # Handle voice notes first — before any other logic
+    # Handle voice notes first
     if media_url and content_type and any(x in content_type.lower() for x in ["audio", "ogg", "mpeg", "mp4", "webm"]):
         resp.message("🎤 Transcribing your voice note…")
 
         def handle_voice():
-            data = download_media(media_url)
-            transcribed = transcribe_audio(data, content_type.lower())
+            try:
+                data = download_media(media_url)
+                transcribed = transcribe_audio(data, content_type.lower())
 
-            if not transcribed or len(transcribed) < 3:
-                send_message(from_number, "Couldn't make out what you said. Could you type it out or try again?")
-                return
+                if not transcribed:
+                    send_message(from_number, "Couldn't make out what you said. Could you type it or try again?")
+                    return
 
-            current_step = get_state(from_number).get("step", "idle")
-            current_state = get_state(from_number)
+                # Always get fresh state inside the thread
+                current_state = get_state(from_number)
+                current_step = current_state.get("step", "idle")
+                has_script = bool(current_state.get("last_script", ""))
 
-            # If waiting for refinement or has a previous script — treat as feedback
-            if current_step == "awaiting_refine" or (current_step == "idle" and current_state.get("last_script")):
-                send_message(from_number, f"🎤 Got your feedback:\n\n_{transcribed}_\n\nRefining now… give me 30 seconds.")
-                process_refine_and_send(from_number, transcribed)
-            else:
-                # Treat as a new brief
-                process_voice_brief_and_send(from_number, transcribed)
+                print(f"Voice routing — step: {current_step}, has_script: {has_script}, text: {transcribed[:50]}")
+
+                # Has a previous script — treat as feedback
+                if current_step in ["awaiting_refine"] or (current_step == "idle" and has_script):
+                    send_message(from_number, f"🎤 Got your feedback:\n\n_{transcribed}_\n\nRefining now… give me 30 seconds.")
+                    process_refine_and_send(from_number, transcribed)
+                else:
+                    # New brief
+                    process_voice_brief_and_send(from_number, transcribed)
+
+            except Exception as e:
+                print(f"Voice handle error: {e}")
+                send_message(from_number, "Something went wrong with your voice note. Please try again or type your message.")
 
         thread = threading.Thread(target=handle_voice)
         thread.daemon = True
@@ -637,7 +614,7 @@ def webhook():
         set_state(from_number, {"step": "idle"})
         resp.message(
             "👋 Hey! I'm Honey's script generator.\n\n"
-            "Send me a brand brief and I'll write the reel script, caption + story in your voice.\n\n"
+            "Send me a brand brief and I'll write the reel script + caption in your voice.\n\n"
             "*I can read:*\n"
             "📄 PDF files\n"
             "📝 Word docs\n"
@@ -652,11 +629,11 @@ def webhook():
     if lower == "help":
         resp.message(
             "*How it works:*\n"
-            "1. Send brief / forward email / voice note\n"
+            "1. Send brief / email / voice note\n"
             "2. Choose format (1/2/3)\n"
             "3. Choose sub-format\n"
             "4. Pick a concept (1/2/3/4)\n"
-            "5. Get reel script + caption + story\n"
+            "5. Get reel script + caption\n"
             "6. Reply with feedback (text or voice) to refine\n\n"
             "*Commands:* hi, help, cancel"
         )
@@ -750,7 +727,7 @@ def webhook():
         return Response(str(resp), mimetype="text/xml")
 
     try:
-        brief_text, from_voice = extract_brief(msg_body, media_url, content_type)
+        brief_text, _ = extract_brief(msg_body, media_url, content_type)
     except Exception as e:
         print(f"Extract error: {e}")
         resp.message("Could not read that file. Please paste the brief as plain text.")
@@ -766,7 +743,7 @@ def webhook():
         try:
             extracted = extract_email_brief(brief_text)
             brief_text = extracted
-            send_message(from_number, f"✅ Got it! Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
+            send_message(from_number, f"✅ Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
         except Exception as e:
             print(f"Email extract error: {e}")
 
