@@ -11,6 +11,7 @@ import io
 import base64
 import threading
 import time
+import shelve
 
 app = Flask(__name__)
 
@@ -18,7 +19,17 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 twilio_client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
 TWILIO_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]
 
-user_state = {}
+state_lock = threading.Lock()
+
+def get_state(number):
+    with state_lock:
+        with shelve.open("/tmp/honey_state") as db:
+            return dict(db.get(number, {"step": "idle"}))
+
+def set_state(number, data):
+    with state_lock:
+        with shelve.open("/tmp/honey_state") as db:
+            db[number] = data
 
 SYSTEM_PROMPT = """You are a script and caption writer for Honey Sheth — an Indian lifestyle, beauty, and travel content creator. You write EXCLUSIVELY in her voice, trained on 37 of her real scripts.
 
@@ -82,6 +93,7 @@ REFERENCE VOICES:
 "Hair fall used to feel like something I'd deal with later. Until later started coming sooner."
 "I hate traveling with a million makeup products. This little stick is all I carried."
 "I went for fashion week… and stayed for the slushies"
+"Could you guess where I am? I am at the Changi airport and we are going to be spending a whole day here!"
 
 OUTPUT FORMAT — STRICT:
 [REEL SCRIPT]
@@ -305,17 +317,18 @@ def process_and_send(from_number, brief_text, format_label, extra_notes=""):
 
     script, caption, error = generate_script(brief_text, format_label, extra_notes)
     done["value"] = True
+
     if error:
         send_message(from_number, error)
         return
 
-    state = user_state.get(from_number, {})
-    user_state[from_number] = {**state, "last_script": script, "last_caption": caption, "step": "idle"}
+    state = get_state(from_number)
+    set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
     send_script_and_caption(from_number, script, caption)
 
 
 def process_refine_and_send(from_number, instruction):
-    state = user_state.get(from_number, {})
+    state = get_state(from_number)
     brief_text = state.get("brief", "")
     format_label = state.get("subformat_label", "Instagram Made Me Buy This (IMMBT series)")
     last_script = state.get("last_script", "")
@@ -334,7 +347,8 @@ def process_refine_and_send(from_number, instruction):
 
     script, caption = refine_script(brief_text, format_label, last_script, last_caption, instruction)
     done["value"] = True
-    user_state[from_number] = {**state, "last_script": script, "last_caption": caption, "step": "idle"}
+
+    set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
     send_message(from_number, "Here's your refined version:")
     send_script_and_caption(from_number, script, caption)
 
@@ -349,12 +363,12 @@ def webhook():
 
     resp  = MessagingResponse()
     lower = msg_body.lower().strip()
-    state = user_state.get(from_number, {"step": "idle"})
+    state = get_state(from_number)
     step  = state.get("step", "idle")
 
     # Global commands
     if lower in ["hi", "hello", "hey", "start"]:
-        user_state[from_number] = {"step": "idle"}
+        set_state(from_number, {"step": "idle"})
         resp.message(
             "👋 Hey! I'm Honey's script generator.\n\n"
             "Send me a brand brief and I'll write the reel script + caption in your voice.\n\n"
@@ -371,7 +385,7 @@ def webhook():
         resp.message(
             "*How it works:*\n"
             "1. Send your brief\n"
-            "2. Choose format (IMMBT / Event / Collab)\n"
+            "2. Choose format (1/2/3)\n"
             "3. Choose sub-format\n"
             "4. Get script + caption\n"
             "5. Reply with feedback to refine\n\n"
@@ -380,17 +394,17 @@ def webhook():
         return Response(str(resp), mimetype="text/xml")
 
     if lower == "cancel":
-        user_state[from_number] = {"step": "idle"}
+        set_state(from_number, {"step": "idle"})
         resp.message("Cancelled. Send a new brief whenever you're ready!")
         return Response(str(resp), mimetype="text/xml")
 
     # Awaiting format selection
     if step == "awaiting_format":
         if lower not in ["1", "2", "3"]:
-            resp.message("Please reply with 1, 2, or 3 to choose your format.")
+            resp.message("Please reply with 1, 2, or 3 to choose your format.\n\n" + FORMAT_MENU)
             return Response(str(resp), mimetype="text/xml")
         chosen_format = FORMAT_KEYS[lower]
-        user_state[from_number] = {**state, "format": chosen_format, "step": "awaiting_subformat"}
+        set_state(from_number, {**state, "format": chosen_format, "step": "awaiting_subformat"})
         resp.message(SUBFORMAT_MENUS[chosen_format])
         return Response(str(resp), mimetype="text/xml")
 
@@ -400,11 +414,11 @@ def webhook():
         max_opts = VALID_SUBFORMAT_COUNTS.get(chosen_format, 3)
         valid = [str(i) for i in range(1, max_opts + 1)]
         if lower not in valid:
-            resp.message(f"Please reply with a number between 1 and {max_opts}.")
+            resp.message(f"Please reply with a number between 1 and {max_opts}.\n\n" + SUBFORMAT_MENUS[chosen_format])
             return Response(str(resp), mimetype="text/xml")
         subformat_label = SUBFORMAT_LABELS[chosen_format][lower]
         brief_text = state.get("brief", "")
-        user_state[from_number] = {**state, "subformat_label": subformat_label, "step": "generating"}
+        set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating"})
         resp.message(f"Got it — *{subformat_label}*\n\n✍️ Writing your script… give me 30 seconds.")
         thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, subformat_label))
         thread.daemon = True
@@ -416,7 +430,7 @@ def webhook():
         if not msg_body:
             resp.message("What would you like to change?")
             return Response(str(resp), mimetype="text/xml")
-        user_state[from_number] = {**state, "step": "generating"}
+        set_state(from_number, {**state, "step": "generating"})
         resp.message("✍️ Refining your script… give me 30 seconds.")
         thread = threading.Thread(target=process_refine_and_send, args=(from_number, msg_body))
         thread.daemon = True
@@ -426,7 +440,7 @@ def webhook():
     # Idle with previous script — short message = refine request
     if step == "idle" and state.get("last_script") and not media_url and len(msg_body) < 200:
         if lower not in ["hi", "hello", "hey", "start", "help", "cancel"]:
-            user_state[from_number] = {**state, "step": "awaiting_refine"}
+            set_state(from_number, {**state, "step": "awaiting_refine"})
             resp.message(
                 "Sounds like feedback on your last script!\n\n"
                 "Reply with what you'd like to change — or send *cancel* to start fresh with a new brief."
@@ -453,12 +467,12 @@ def webhook():
         resp.message("I cannot process voice notes right now. Please type the brief or send as PDF or Word doc.")
         return Response(str(resp), mimetype="text/xml")
 
-    user_state[from_number] = {
+    set_state(from_number, {
         "step": "awaiting_format",
         "brief": brief_text,
         "last_script": state.get("last_script", ""),
         "last_caption": state.get("last_caption", "")
-    }
+    })
     resp.message("Got your brief!\n\n" + FORMAT_MENU)
     return Response(str(resp), mimetype="text/xml")
 
