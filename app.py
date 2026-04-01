@@ -93,7 +93,6 @@ REFERENCE VOICES:
 "Hair fall used to feel like something I'd deal with later. Until later started coming sooner."
 "I hate traveling with a million makeup products. This little stick is all I carried."
 "I went for fashion week… and stayed for the slushies"
-"Could you guess where I am? I am at the Changi airport and we are going to be spending a whole day here!"
 
 OUTPUT FORMAT — STRICT:
 [REEL SCRIPT]
@@ -160,6 +159,13 @@ SUBFORMAT_LABELS = {
 FORMAT_KEYS = {"1": "immbt", "2": "event", "3": "collab"}
 VALID_SUBFORMAT_COUNTS = {"immbt": 3, "event": 3, "collab": 5}
 
+GREETING_WORDS = ["hi", "hello", "hey", "start"]
+
+
+def is_greeting(text):
+    lower = text.lower().strip().rstrip("!.,? ")
+    return any(lower.startswith(w) for w in GREETING_WORDS)
+
 
 def send_message(to, body):
     try:
@@ -215,7 +221,44 @@ def extract_brief(msg_body, media_url, content_type):
     return msg_body.strip()
 
 
-def generate_script(brief_text, format_label, extra_notes=""):
+def generate_concepts(brief_text, format_label):
+    """Generate 3-4 creative concept ideas for the user to choose from."""
+    prompt = f"""Based on this brand brief, generate 4 distinct creative concepts for an Instagram reel by Honey Sheth.
+
+CONTENT FORMAT: {format_label}
+
+BRAND BRIEF:
+{brief_text}
+
+Each concept should have a different angle, hook, or emotional approach. Think about what would feel most authentic to Honey's voice and most compelling to her audience.
+
+Return EXACTLY this format, nothing else:
+
+CONCEPT 1: [Short punchy title]
+[2 sentences describing the hook and angle]
+
+CONCEPT 2: [Short punchy title]
+[2 sentences describing the hook and angle]
+
+CONCEPT 3: [Short punchy title]
+[2 sentences describing the hook and angle]
+
+CONCEPT 4: [Short punchy title]
+[2 sentences describing the hook and angle]
+
+No preamble. No notes. Just the 4 concepts."""
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=600,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text.strip()
+
+
+def generate_script(brief_text, format_label, concept=None, extra_notes=""):
+    """Generate full script + caption, optionally based on a chosen concept."""
     if brief_text.startswith("[IMAGE:"):
         match = re.match(r'\[IMAGE:(.+):(.+)\]', brief_text)
         if match:
@@ -232,9 +275,11 @@ def generate_script(brief_text, format_label, extra_notes=""):
     elif brief_text == "[AUDIO]":
         return None, None, "I cannot process voice notes right now. Please type the brief or send as PDF or Word doc."
     else:
+        concept_line = f"\nCHOSEN CONCEPT TO EXECUTE:\n{concept}\n" if concept else ""
         prompt = f"""Write a full Instagram reel script and caption.
 
 CONTENT FORMAT: {format_label}
+{concept_line}
 {extra_notes}
 
 BRAND BRIEF:
@@ -303,7 +348,50 @@ def send_script_and_caption(to, script, caption):
     )
 
 
-def process_and_send(from_number, brief_text, format_label, extra_notes=""):
+def process_concepts_and_send(from_number, brief_text, format_label):
+    """Generate concepts in background and send to user."""
+    done = {"value": False}
+
+    def progress():
+        time.sleep(15)
+        if not done["value"]:
+            send_message(from_number, "Thinking up concepts… almost there ✍️")
+
+    t = threading.Thread(target=progress)
+    t.daemon = True
+    t.start()
+
+    try:
+        concepts_text = generate_concepts(brief_text, format_label)
+        done["value"] = True
+
+        # Parse concepts to store individually
+        concepts = []
+        pattern = re.findall(r'CONCEPT \d+:(.+?)(?=CONCEPT \d+:|$)', concepts_text, re.DOTALL)
+        for c in pattern:
+            concepts.append(c.strip())
+
+        state = get_state(from_number)
+        set_state(from_number, {
+            **state,
+            "concepts": concepts,
+            "step": "awaiting_concept"
+        })
+
+        msg = "Here are your concept options — reply with the number you want me to write:\n\n"
+        for i, concept in enumerate(concepts, 1):
+            msg += f"{i}️⃣ {concept}\n\n"
+
+        send_in_chunks(from_number, msg.strip())
+
+    except Exception as e:
+        done["value"] = True
+        print(f"Concept generation error: {e}")
+        send_message(from_number, "Something went wrong. Try sending your brief again.")
+
+
+def process_and_send(from_number, brief_text, format_label, concept=None, extra_notes=""):
+    """Generate script in background and send results."""
     done = {"value": False}
 
     def progress():
@@ -315,7 +403,7 @@ def process_and_send(from_number, brief_text, format_label, extra_notes=""):
     t.daemon = True
     t.start()
 
-    script, caption, error = generate_script(brief_text, format_label, extra_notes)
+    script, caption, error = generate_script(brief_text, format_label, concept, extra_notes)
     done["value"] = True
 
     if error:
@@ -367,7 +455,7 @@ def webhook():
     step  = state.get("step", "idle")
 
     # Global commands
-if any(lower.startswith(w) for w in ["hi", "hello", "hey", "start"]):
+    if is_greeting(msg_body):
         set_state(from_number, {"step": "idle"})
         resp.message(
             "👋 Hey! I'm Honey's script generator.\n\n"
@@ -387,8 +475,9 @@ if any(lower.startswith(w) for w in ["hi", "hello", "hey", "start"]):
             "1. Send your brief\n"
             "2. Choose format (1/2/3)\n"
             "3. Choose sub-format\n"
-            "4. Get script + caption\n"
-            "5. Reply with feedback to refine\n\n"
+            "4. Pick a concept (1/2/3/4)\n"
+            "5. Get your script + caption\n"
+            "6. Reply with feedback to refine\n\n"
             "*Commands:* hi, help, cancel"
         )
         return Response(str(resp), mimetype="text/xml")
@@ -418,9 +507,26 @@ if any(lower.startswith(w) for w in ["hi", "hello", "hey", "start"]):
             return Response(str(resp), mimetype="text/xml")
         subformat_label = SUBFORMAT_LABELS[chosen_format][lower]
         brief_text = state.get("brief", "")
-        set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating"})
-        resp.message(f"Got it — *{subformat_label}*\n\n✍️ Writing your script… give me 30 seconds.")
-        thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, subformat_label))
+        set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating_concepts"})
+        resp.message(f"Got it — *{subformat_label}*\n\n💡 Generating concept ideas… give me 15 seconds.")
+        thread = threading.Thread(target=process_concepts_and_send, args=(from_number, brief_text, subformat_label))
+        thread.daemon = True
+        thread.start()
+        return Response(str(resp), mimetype="text/xml")
+
+    # Awaiting concept selection
+    if step == "awaiting_concept":
+        concepts = state.get("concepts", [])
+        valid = [str(i) for i in range(1, len(concepts) + 1)]
+        if lower not in valid:
+            resp.message(f"Please reply with a number between 1 and {len(concepts)} to choose your concept.")
+            return Response(str(resp), mimetype="text/xml")
+        chosen_concept = concepts[int(lower) - 1]
+        brief_text = state.get("brief", "")
+        format_label = state.get("subformat_label", "")
+        set_state(from_number, {**state, "chosen_concept": chosen_concept, "step": "generating"})
+        resp.message(f"Love it! ✍️ Writing your full script… give me 30 seconds.")
+        thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, chosen_concept))
         thread.daemon = True
         thread.start()
         return Response(str(resp), mimetype="text/xml")
@@ -439,7 +545,7 @@ if any(lower.startswith(w) for w in ["hi", "hello", "hey", "start"]):
 
     # Idle with previous script — short message = refine request
     if step == "idle" and state.get("last_script") and not media_url and len(msg_body) < 200:
-        if lower not in ["hi", "hello", "hey", "start", "help", "cancel"]:
+        if not is_greeting(msg_body) and lower not in ["help", "cancel"]:
             set_state(from_number, {**state, "step": "awaiting_refine"})
             resp.message(
                 "Sounds like feedback on your last script!\n\n"
