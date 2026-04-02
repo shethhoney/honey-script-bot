@@ -759,7 +759,26 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}, 200
+    return "ok", 200
+
+
+def self_ping():
+    """Ping own health endpoint every 4 minutes to stay warm forever."""
+    time.sleep(30)
+    url = os.environ.get("RENDER_EXTERNAL_URL", "https://honey-script-bot.onrender.com")
+    health_url = url.rstrip("/") + "/health"
+    while True:
+        try:
+            requests.get(health_url, timeout=10)
+            print(f"Self-ping OK")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
+        time.sleep(240)
+
+
+# Start self-ping thread when gunicorn loads the module
+_ping_thread = threading.Thread(target=self_ping, daemon=True)
+_ping_thread.start()
 
 
 if __name__ == "__main__":
