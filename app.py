@@ -16,11 +16,18 @@ import tempfile
 
 app = Flask(__name__)
 
+# Validate required env vars at startup with clear error messages
+_REQUIRED_ENV = ["ANTHROPIC_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_NUMBER", "GROQ_API_KEY"]
+for _key in _REQUIRED_ENV:
+    if not os.environ.get(_key):
+        raise RuntimeError(f"Missing required environment variable: {_key}")
+
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 twilio_client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
 TWILIO_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
+# Single lock for all shelve access — safe with --workers 1
 state_lock = threading.Lock()
 
 def get_state(number):
@@ -160,12 +167,12 @@ SUBFORMAT_LABELS = {
 
 FORMAT_KEYS = {"1": "immbt", "2": "event", "3": "collab"}
 VALID_SUBFORMAT_COUNTS = {"immbt": 3, "event": 3, "collab": 5}
-GREETING_WORDS = ["hi", "hello", "hey", "start"]
 
+# Exact greeting words only — not prefix matches that catch "hey" in brand briefs
+GREETING_TRIGGERS = {"hi", "hello", "hey", "start", "hi!", "hello!", "hey!"}
 
 def is_greeting(text):
-    cleaned = text.lower().strip().rstrip("!.,? ")
-    return any(cleaned.startswith(w) for w in GREETING_WORDS)
+    return text.lower().strip().rstrip("!.,? ") in GREETING_TRIGGERS
 
 
 def send_message(to, body):
@@ -176,13 +183,27 @@ def send_message(to, body):
 
 
 def send_in_chunks(to, text, chunk_size=1500):
+    if not text:
+        print("send_in_chunks called with empty text — skipping")
+        return
     text = text.strip()
+    if not text:
+        return
     if len(text) <= chunk_size:
         send_message(to, text)
         return
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    # Split on newlines near the boundary to avoid mid-word cuts
+    chunks = []
+    while len(text) > chunk_size:
+        split_at = text.rfind("\n", 0, chunk_size)
+        if split_at == -1:
+            split_at = chunk_size
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    if text:
+        chunks.append(text)
     for chunk in chunks:
-        send_message(to, chunk.strip())
+        send_message(to, chunk)
         time.sleep(0.5)
 
 
@@ -197,6 +218,7 @@ def download_media(media_url):
 
 
 def transcribe_audio(data, content_type):
+    tmp_path = None
     try:
         if "ogg" in content_type:
             ext = ".ogg"
@@ -221,8 +243,6 @@ def transcribe_audio(data, content_type):
                 data={"model": "whisper-large-v3", "language": "en"}
             )
 
-        os.unlink(tmp_path)
-
         if response.status_code == 200:
             result = response.json().get("text", "").strip()
             print(f"Transcription: '{result}'")
@@ -234,16 +254,30 @@ def transcribe_audio(data, content_type):
     except Exception as e:
         print(f"Transcription error: {e}")
         return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def extract_pdf(data):
-    reader = PyPDF2.PdfReader(io.BytesIO(data))
-    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except Exception as e:
+        print(f"PDF extract error: {e}")
+        return ""
 
 
 def extract_docx(data):
-    result = mammoth.extract_raw_text(io.BytesIO(data))
-    return result.value.strip()
+    try:
+        result = mammoth.extract_raw_text(io.BytesIO(data))
+        return result.value.strip()
+    except Exception as e:
+        print(f"DOCX extract error: {e}")
+        return ""
 
 
 def extract_email_brief(email_text):
@@ -263,7 +297,7 @@ EMAIL:
 No preamble. Just the extracted brief."""
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-6",
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -323,7 +357,7 @@ CONCEPT 4: [Short punchy title]
 No preamble. No notes. Just the 4 concepts."""
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-6",
         max_tokens=600,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}]
@@ -360,14 +394,14 @@ VARIATION 2
 
 No preamble. No notes."""
 
-        messages = [{"role": "user", "content": prompt}]
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-6",
             max_tokens=4000,
             system=SYSTEM_PROMPT,
-            messages=messages
+            messages=[{"role": "user", "content": prompt}]
         )
-        return response.content[0].text.strip(), None, None
+        raw = response.content[0].text.strip()
+        return raw if raw else "", None, None
 
     if brief_text.startswith("[IMAGE:"):
         match = re.match(r'\[IMAGE:(.+):(.+)\]', brief_text)
@@ -396,13 +430,13 @@ Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA sof
         messages = [{"role": "user", "content": prompt}]
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-6",
         max_tokens=2200,
         system=SYSTEM_PROMPT,
         messages=messages
     )
     raw = response.content[0].text
-    sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\]|$)', raw, re.IGNORECASE)
+    sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\])', raw, re.IGNORECASE)
     cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
     script = sm.group(1).strip() if sm else raw.strip()
     caption = cm.group(1).strip() if cm else ""
@@ -429,13 +463,13 @@ REFINEMENT REQUEST:
 Rewrite incorporating this feedback. Keep everything that worked. Only change what was asked. Stay in Honey's voice."""
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-6",
         max_tokens=2200,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.content[0].text
-    sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\]|$)', raw, re.IGNORECASE)
+    sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\])', raw, re.IGNORECASE)
     cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
     script = sm.group(1).strip() if sm else raw.strip()
     caption = cm.group(1).strip() if cm else ""
@@ -474,22 +508,33 @@ def process_concepts_and_send(from_number, brief_text, format_label):
         concepts_text = generate_concepts(brief_text, format_label)
         done["value"] = True
         concepts = []
-        pattern = re.findall(r'CONCEPT \d+:(.+?)(?=CONCEPT \d+:|$)', concepts_text, re.DOTALL)
+        pattern = re.findall(r'CONCEPT \d+:\s*(.+?)(?=CONCEPT \d+:|$)', concepts_text, re.DOTALL)
         for c in pattern:
-            concepts.append(c.strip())
+            stripped = c.strip()
+            if stripped:
+                concepts.append(stripped)
+
+        if not concepts:
+            set_state(from_number, {**get_state(from_number), "step": "idle"})
+            send_message(from_number, "Couldn't parse the concepts. Send your brief again.")
+            return
 
         state = get_state(from_number)
         set_state(from_number, {**state, "concepts": concepts, "step": "awaiting_concept"})
 
+        count = len(concepts)
         msg = "Here are your concept options:\n\n"
         for i, concept in enumerate(concepts, 1):
             msg += f"{i}️⃣ {concept}\n\n"
-        msg += "Reply with 1, 2, 3, or 4 to choose.\nOr reply *all* to get all 4 written out."
+        options_str = "/".join(str(i) for i in range(1, count + 1))
+        msg += f"Reply with {options_str} to choose.\nOr reply *all* to get all {count} written out."
         send_in_chunks(from_number, msg.strip())
 
     except Exception as e:
         done["value"] = True
         print(f"Concept error: {e}")
+        state = get_state(from_number)
+        set_state(from_number, {**state, "step": "idle"})
         send_message(from_number, "Something went wrong generating concepts. Send your brief again.")
 
 
@@ -505,21 +550,35 @@ def process_and_send(from_number, brief_text, format_label, concept=None, extra_
     t.daemon = True
     t.start()
 
-    if count > 1:
-        raw_multiple, _, _ = generate_script(brief_text, format_label, concept, extra_notes, count=count)
+    try:
+        if count > 1:
+            raw_multiple, _, _ = generate_script(brief_text, format_label, concept, extra_notes, count=count)
+            done["value"] = True
+            if not raw_multiple:
+                state = get_state(from_number)
+                set_state(from_number, {**state, "step": "idle"})
+                send_message(from_number, "Something went wrong generating the scripts. Send your brief again.")
+                return
+            state = get_state(from_number)
+            set_state(from_number, {**state, "last_script": raw_multiple, "last_caption": "", "step": "idle"})
+            send_script_and_caption(from_number, None, None, multiple_raw=raw_multiple)
+        else:
+            script, caption, error = generate_script(brief_text, format_label, concept, extra_notes)
+            done["value"] = True
+            if error:
+                state = get_state(from_number)
+                set_state(from_number, {**state, "step": "idle"})
+                send_message(from_number, error)
+                return
+            state = get_state(from_number)
+            set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
+            send_script_and_caption(from_number, script, caption)
+    except Exception as e:
         done["value"] = True
+        print(f"Generate error: {e}")
         state = get_state(from_number)
-        set_state(from_number, {**state, "last_script": raw_multiple, "last_caption": "", "step": "idle"})
-        send_script_and_caption(from_number, None, None, multiple_raw=raw_multiple)
-    else:
-        script, caption, error = generate_script(brief_text, format_label, concept, extra_notes)
-        done["value"] = True
-        if error:
-            send_message(from_number, error)
-            return
-        state = get_state(from_number)
-        set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
-        send_script_and_caption(from_number, script, caption)
+        set_state(from_number, {**state, "step": "idle"})
+        send_message(from_number, "Something went wrong writing the script. Send your brief again.")
 
 
 def process_refine_and_send(from_number, instruction):
@@ -540,11 +599,17 @@ def process_refine_and_send(from_number, instruction):
     t.daemon = True
     t.start()
 
-    script, caption = refine_script(brief_text, format_label, last_script, last_caption, instruction)
-    done["value"] = True
-    set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
-    send_message(from_number, "Here's your refined version:")
-    send_script_and_caption(from_number, script, caption)
+    try:
+        script, caption = refine_script(brief_text, format_label, last_script, last_caption, instruction)
+        done["value"] = True
+        set_state(from_number, {**state, "last_script": script, "last_caption": caption, "step": "idle"})
+        send_message(from_number, "Here's your refined version:")
+        send_script_and_caption(from_number, script, caption)
+    except Exception as e:
+        done["value"] = True
+        print(f"Refine error: {e}")
+        set_state(from_number, {**state, "step": "idle"})
+        send_message(from_number, "Something went wrong refining. Send your feedback again.")
 
 
 def process_voice_brief_and_send(from_number, transcribed_text):
@@ -572,7 +637,7 @@ def webhook():
     state = get_state(from_number)
     step  = state.get("step", "idle")
 
-    # Handle voice notes first
+    # ── Handle voice notes first ──────────────────────────────────────────────
     if media_url and content_type and any(x in content_type.lower() for x in ["audio", "ogg", "mpeg", "mp4", "webm"]):
         resp.message("🎤 Transcribing your voice note…")
 
@@ -585,19 +650,16 @@ def webhook():
                     send_message(from_number, "Couldn't make out what you said. Could you type it or try again?")
                     return
 
-                # Always get fresh state inside the thread
                 current_state = get_state(from_number)
                 current_step = current_state.get("step", "idle")
                 has_script = bool(current_state.get("last_script", ""))
 
                 print(f"Voice routing — step: {current_step}, has_script: {has_script}, text: {transcribed[:50]}")
 
-                # Has a previous script — treat as feedback
-                if current_step in ["awaiting_refine"] or (current_step == "idle" and has_script):
+                if current_step == "awaiting_refine" or (current_step == "idle" and has_script):
                     send_message(from_number, f"🎤 Got your feedback:\n\n_{transcribed}_\n\nRefining now… give me 30 seconds.")
                     process_refine_and_send(from_number, transcribed)
                 else:
-                    # New brief
                     process_voice_brief_and_send(from_number, transcribed)
 
             except Exception as e:
@@ -609,7 +671,7 @@ def webhook():
         thread.start()
         return Response(str(resp), mimetype="text/xml")
 
-    # Global commands
+    # ── Global commands ───────────────────────────────────────────────────────
     if is_greeting(msg_body) and not media_url:
         set_state(from_number, {"step": "idle"})
         resp.message(
@@ -644,7 +706,7 @@ def webhook():
         resp.message("Cancelled. Send a new brief whenever you're ready!")
         return Response(str(resp), mimetype="text/xml")
 
-    # Awaiting format selection
+    # ── Awaiting format selection ─────────────────────────────────────────────
     if step == "awaiting_format":
         if lower not in ["1", "2", "3"]:
             resp.message("Please reply with 1, 2, or 3.\n\n" + FORMAT_MENU)
@@ -654,7 +716,7 @@ def webhook():
         resp.message(SUBFORMAT_MENUS[chosen_format])
         return Response(str(resp), mimetype="text/xml")
 
-    # Awaiting sub-format selection
+    # ── Awaiting sub-format selection ─────────────────────────────────────────
     if step == "awaiting_subformat":
         chosen_format = state.get("format", "immbt")
         max_opts = VALID_SUBFORMAT_COUNTS.get(chosen_format, 3)
@@ -671,23 +733,25 @@ def webhook():
         thread.start()
         return Response(str(resp), mimetype="text/xml")
 
-    # Awaiting concept selection
+    # ── Awaiting concept selection ────────────────────────────────────────────
     if step == "awaiting_concept":
         concepts = state.get("concepts", [])
         brief_text = state.get("brief", "")
         format_label = state.get("subformat_label", "")
+        count = len(concepts)
 
         if lower == "all":
             set_state(from_number, {**state, "step": "generating"})
-            resp.message("Writing all 4 variations… give me 60 seconds ✍️")
-            thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, None, "", 4))
+            resp.message(f"Writing all {count} variations… give me 60 seconds ✍️")
+            thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, None, "", count))
             thread.daemon = True
             thread.start()
             return Response(str(resp), mimetype="text/xml")
 
-        valid = [str(i) for i in range(1, len(concepts) + 1)]
+        valid = [str(i) for i in range(1, count + 1)]
         if lower not in valid:
-            resp.message("Please reply with 1, 2, 3, or 4 — or reply *all* to get all variations.")
+            options_str = "/".join(valid)
+            resp.message(f"Please reply with {options_str} — or reply *all* to get all variations.")
             return Response(str(resp), mimetype="text/xml")
 
         chosen_concept = concepts[int(lower) - 1]
@@ -698,7 +762,7 @@ def webhook():
         thread.start()
         return Response(str(resp), mimetype="text/xml")
 
-    # Awaiting refine instruction
+    # ── Awaiting refine instruction ───────────────────────────────────────────
     if step == "awaiting_refine":
         if not msg_body:
             resp.message("What would you like to change? Type or send a voice note.")
@@ -710,20 +774,31 @@ def webhook():
         thread.start()
         return Response(str(resp), mimetype="text/xml")
 
-    # Idle with previous script — short message = refine
-    if step == "idle" and state.get("last_script") and not media_url and len(msg_body) < 200:
+    # ── Idle with previous script: send feedback directly ────────────────────
+    # Fixed: short message while idle+has_script now goes straight to refine
+    # instead of making user send the feedback twice
+    if step == "idle" and state.get("last_script") and not media_url:
         if not is_greeting(msg_body) and lower not in ["help", "cancel"]:
-            set_state(from_number, {**state, "step": "awaiting_refine"})
-            resp.message(
-                "Sounds like feedback on your last script!\n\n"
-                "Reply with what you'd like to change — text or voice note.\n"
-                "Or send *cancel* to start fresh."
-            )
-            return Response(str(resp), mimetype="text/xml")
+            # Only hijack as feedback if message is clearly feedback (short)
+            # AND doesn't look like a new brief (no brand/product signals)
+            brief_signals = ["brief", "brand", "product", "collab", "campaign", "launch", "event", "partnership"]
+            looks_like_brief = len(msg_body) > 300 or any(s in lower for s in brief_signals)
+            if not looks_like_brief and len(msg_body) < 300:
+                set_state(from_number, {**state, "step": "generating"})
+                resp.message("✍️ Refining… give me 30 seconds.")
+                thread = threading.Thread(target=process_refine_and_send, args=(from_number, msg_body))
+                thread.daemon = True
+                thread.start()
+                return Response(str(resp), mimetype="text/xml")
 
-    # New brief
+    # ── New brief ─────────────────────────────────────────────────────────────
     if not msg_body and not media_url:
         resp.message("Send me a brand brief — text, PDF, Word doc, image, or voice note!")
+        return Response(str(resp), mimetype="text/xml")
+
+    # Guard against huge inputs
+    if msg_body and len(msg_body) > 8000:
+        resp.message("That brief is very long! Please trim it to the key details — brand, product, key claims, and deliverables.")
         return Response(str(resp), mimetype="text/xml")
 
     try:
@@ -746,6 +821,7 @@ def webhook():
             send_message(from_number, f"✅ Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
         except Exception as e:
             print(f"Email extract error: {e}")
+            send_message(from_number, "Couldn't auto-extract the brief — proceeding with the full email text.")
 
     set_state(from_number, {
         "step": "awaiting_format",
@@ -760,25 +836,6 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
-
-
-def self_ping():
-    """Ping own health endpoint every 4 minutes to stay warm forever."""
-    time.sleep(30)
-    url = os.environ.get("RENDER_EXTERNAL_URL", "https://honey-script-bot.onrender.com")
-    health_url = url.rstrip("/") + "/health"
-    while True:
-        try:
-            requests.get(health_url, timeout=10)
-            print(f"Self-ping OK")
-        except Exception as e:
-            print(f"Self-ping failed: {e}")
-        time.sleep(240)
-
-
-# Start self-ping thread when gunicorn loads the module
-_ping_thread = threading.Thread(target=self_ping, daemon=True)
-_ping_thread.start()
 
 
 if __name__ == "__main__":
