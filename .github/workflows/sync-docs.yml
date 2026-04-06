@@ -1,0 +1,234 @@
+name: Sync TDD and PRD to Notion
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'requirements.txt'
+      - 'railway.toml'
+
+jobs:
+  sync-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install anthropic requests
+
+      - name: Generate updated TDD and PRD, push to GitHub, sync to Notion
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os, re, requests, anthropic
+
+          client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+          NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+          NOTION_HEADERS = {
+              "Authorization": f"Bearer {NOTION_TOKEN}",
+              "Content-Type": "application/json",
+              "Notion-Version": "2022-06-28"
+          }
+          TDD_PAGE_ID = "337d776f96d780199833c9cde3cea28e"
+          PRD_PAGE_ID = "336d776f96d780d48f10f2eb8fc098e4"
+
+          # ── Read codebase ──────────────────────────────────────────────────
+          def read_file(path):
+              try:
+                  with open(path) as f:
+                      return f.read()
+              except:
+                  return ""
+
+          app_py       = read_file("app.py")
+          requirements = read_file("requirements.txt")
+          railway_toml = read_file("railway.toml")
+          old_tdd      = read_file("TDD.md")
+          old_prd      = read_file("PRD.md")
+
+          print("Read codebase. Generating TDD...")
+
+          # ── Generate TDD ───────────────────────────────────────────────────
+          tdd_prompt = f"""You are a technical writer. Read the following codebase and generate a comprehensive, accurate Technical Design Document (TDD) in Markdown format.
+
+          The project is the Honey Script Bot — a personal WhatsApp-based AI tool that generates Instagram Reel scripts and captions for content creator Honey Sheth.
+
+          APP.PY (main application):
+          {app_py}
+
+          REQUIREMENTS.TXT:
+          {requirements}
+
+          RAILWAY.TOML:
+          {railway_toml}
+
+          Generate a complete TDD.md with these sections:
+          1. System Overview
+          2. Tech Stack (every library/service with reasoning for choice)
+          3. Architecture & File Structure
+          4. Environment Variables (all 5 with descriptions)
+          5. State Machine (all states and transitions: idle → awaiting_format → awaiting_subformat → generating_concepts → awaiting_concept → generating → awaiting_refine)
+          6. API Integrations (Anthropic claude-opus-4-6, Groq whisper-large-v3, Twilio WhatsApp)
+          7. Script Library & Learning System (save command, honey_library.json, few-shot injection, feedback logging in honey_feedback.json)
+          8. Media Processing (PDF, DOCX, image vision, voice transcription)
+          9. Concurrency Model (daemon threads, --workers 1, state_lock, why single worker)
+          10. Storage & Persistence (shelve, /data Railway volume detection, /tmp fallback)
+          11. Deployment (Railway Hobby, railway.toml, healthcheck path)
+          12. Routes (/webhook POST, /health GET)
+          13. Format/Subformat Taxonomy (IMMBT x3, Event x3, Collab x5)
+          14. Security Considerations
+          15. Cost Model (Railway $5/mo, Anthropic Opus pricing, Twilio per message, Groq free)
+          16. Known Limitations
+          17. Future Improvements
+
+          Be accurate — only document what actually exists in the code. Include version info (Version: 2.0, Date: today).
+          Return only the markdown content, no preamble."""
+
+          tdd_resp = client.messages.create(
+              model="claude-opus-4-6",
+              max_tokens=4000,
+              messages=[{"role": "user", "content": tdd_prompt}]
+          )
+          tdd_content = tdd_resp.content[0].text.strip()
+          print("TDD generated. Generating PRD...")
+
+          # ── Generate PRD ───────────────────────────────────────────────────
+          prd_prompt = f"""You are a product manager. Read the following codebase and generate a comprehensive Product Requirements Document (PRD) in Markdown format.
+
+          The project is the Honey Script Bot — a personal WhatsApp-based AI tool that generates Instagram Reel scripts and captions for content creator Honey Sheth.
+
+          APP.PY (source of truth):
+          {app_py}
+
+          OLD PRD (for reference, may be outdated):
+          {old_prd}
+
+          Generate a complete PRD.md with these sections:
+          1. Overview — what it is, who it's for, current status (Live on Railway)
+          2. Problem Statement — the pain point it solves
+          3. Functional Requirements — every feature with numbered requirements:
+             - Brief ingestion (text, PDF, DOCX, image, voice note, forwarded email)
+             - Format/subformat selection menu
+             - Concept generation (4 options)
+             - Script + caption generation using claude-opus-4-6
+             - Refinement loop (text and voice feedback)
+             - Save command — saves approved scripts to library
+             - Library command — shows saved scripts and feedback count
+             - Learning system — approved scripts injected as few-shot examples
+             - Feedback logging — refinement instructions logged and used in future refines
+             - Voice note transcription via Groq Whisper
+             - Multi-format output (single script, all 4 variations)
+          4. Non-Functional Requirements (always-on Railway, <30s response, voice support, persistent learning)
+          5. Success Metrics
+          6. Risks & Mitigations
+
+          Be thorough — every feature in the code must appear in the PRD. Include version info (Version: 2.0, Date: today).
+          Return only the markdown content, no preamble."""
+
+          prd_resp = client.messages.create(
+              model="claude-opus-4-6",
+              max_tokens=3000,
+              messages=[{"role": "user", "content": prd_prompt}]
+          )
+          prd_content = prd_resp.content[0].text.strip()
+          print("PRD generated. Writing files...")
+
+          # ── Write files ────────────────────────────────────────────────────
+          with open("TDD.md", "w") as f:
+              f.write(tdd_content)
+          with open("PRD.md", "w") as f:
+              f.write(prd_content)
+          print("Files written.")
+
+          # ── Notion sync ────────────────────────────────────────────────────
+          def delete_all_blocks(page_id):
+              url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+              while True:
+                  r = requests.get(url, headers=NOTION_HEADERS)
+                  data = r.json()
+                  blocks = data.get("results", [])
+                  if not blocks:
+                      break
+                  for block in blocks:
+                      requests.delete(f"https://api.notion.com/v1/blocks/{block['id']}", headers=NOTION_HEADERS)
+                  if not data.get("has_more"):
+                      break
+
+          def md_to_notion_blocks(md_text):
+              blocks = []
+              in_code = False
+              code_lines = []
+              for line in md_text.split("\n"):
+                  if line.startswith("```"):
+                      if in_code:
+                          blocks.append({
+                              "object": "block", "type": "code",
+                              "code": {"rich_text": [{"type": "text", "text": {"content": "\n".join(code_lines)}}], "language": "python"}
+                          })
+                          code_lines = []
+                          in_code = False
+                      else:
+                          in_code = True
+                      continue
+                  if in_code:
+                      code_lines.append(line)
+                      continue
+                  if line.startswith("### "):
+                      blocks.append({"object":"block","type":"heading_3","heading_3":{"rich_text":[{"type":"text","text":{"content":line[4:].strip()[:2000]}}]}})
+                  elif line.startswith("## "):
+                      blocks.append({"object":"block","type":"heading_2","heading_2":{"rich_text":[{"type":"text","text":{"content":line[3:].strip()[:2000]}}]}})
+                  elif line.startswith("# "):
+                      blocks.append({"object":"block","type":"heading_1","heading_1":{"rich_text":[{"type":"text","text":{"content":line[2:].strip()[:2000]}}]}})
+                  elif line.startswith("- ") or line.startswith("* "):
+                      blocks.append({"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":[{"type":"text","text":{"content":line[2:].strip()[:2000]}}]}})
+                  elif re.match(r'^\d+\. ', line):
+                      content = re.sub(r'^\d+\. ', '', line).strip()
+                      blocks.append({"object":"block","type":"numbered_list_item","numbered_list_item":{"rich_text":[{"type":"text","text":{"content":content[:2000]}}]}})
+                  elif line.strip() == "":
+                      blocks.append({"object":"block","type":"paragraph","paragraph":{"rich_text":[]}})
+                  else:
+                      blocks.append({"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":line.strip()[:2000]}}]}})
+              return blocks
+
+          def sync_to_notion(page_id, md_content, name):
+              print(f"Syncing {name} to Notion...")
+              try:
+                  delete_all_blocks(page_id)
+                  blocks = md_to_notion_blocks(md_content)
+                  for i in range(0, len(blocks), 100):
+                      batch = blocks[i:i+100]
+                      r = requests.patch(
+                          f"https://api.notion.com/v1/blocks/{page_id}/children",
+                          headers=NOTION_HEADERS,
+                          json={"children": batch}
+                      )
+                      print(f"  Notion batch {i//100+1}: {r.status_code}")
+                  print(f"{name} synced to Notion.")
+              except Exception as e:
+                  print(f"Notion sync error for {name}: {e}")
+
+          sync_to_notion(TDD_PAGE_ID, tdd_content, "TDD")
+          sync_to_notion(PRD_PAGE_ID, prd_content, "PRD")
+          print("All done!")
+          EOF
+
+      - name: Commit and push updated docs
+        run: |
+          git config user.name "Honey Script Bot Docs"
+          git config user.email "bot@honeyscriptbot.com"
+          git add TDD.md PRD.md
+          git diff --cached --stat
+          git diff --cached --quiet || git commit -m "docs: auto-sync TDD and PRD [$(date +%Y-%m-%d)]"
+          git push
