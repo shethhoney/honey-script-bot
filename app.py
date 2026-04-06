@@ -1,6 +1,9 @@
 import os
 import re
+import json
+import uuid
 import requests
+from datetime import datetime
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -16,7 +19,7 @@ import tempfile
 
 app = Flask(__name__)
 
-# Validate required env vars at startup with clear error messages
+# Validate required env vars at startup
 _REQUIRED_ENV = ["ANTHROPIC_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_NUMBER", "GROQ_API_KEY"]
 for _key in _REQUIRED_ENV:
     if not os.environ.get(_key):
@@ -27,18 +30,141 @@ twilio_client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH
 TWILIO_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
-# Single lock for all shelve access — safe with --workers 1
-state_lock = threading.Lock()
+# ── Persistent storage ────────────────────────────────────────────────────────
+# Uses /data if Railway volume is mounted, falls back to /tmp
+STORAGE_PATH = "/data" if os.path.isdir("/data") else "/tmp"
+STATE_DB     = os.path.join(STORAGE_PATH, "honey_state")
+LIBRARY_FILE = os.path.join(STORAGE_PATH, "honey_library.json")
+FEEDBACK_FILE = os.path.join(STORAGE_PATH, "honey_feedback.json")
+
+print(f"Storage path: {STORAGE_PATH}")
+
+state_lock   = threading.Lock()
+library_lock = threading.Lock()
+
+MAX_LIBRARY_SIZE  = 20   # rolling window of approved scripts
+MAX_FEEDBACK_SIZE = 30   # rolling window of feedback entries
+EXAMPLES_IN_PROMPT = 3   # how many approved scripts to inject per generation
+
+
+# ── State (conversation flow) ─────────────────────────────────────────────────
 
 def get_state(number):
     with state_lock:
-        with shelve.open("/tmp/honey_state") as db:
+        with shelve.open(STATE_DB) as db:
             return dict(db.get(number, {"step": "idle"}))
 
 def set_state(number, data):
     with state_lock:
-        with shelve.open("/tmp/honey_state") as db:
+        with shelve.open(STATE_DB) as db:
             db[number] = data
+
+
+# ── Script library ────────────────────────────────────────────────────────────
+
+def load_library():
+    with library_lock:
+        try:
+            if os.path.exists(LIBRARY_FILE):
+                with open(LIBRARY_FILE, "r") as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Library load error: {e}")
+        return []
+
+def save_library(entries):
+    with library_lock:
+        try:
+            with open(LIBRARY_FILE, "w") as f:
+                json.dump(entries, f, indent=2)
+        except Exception as e:
+            print(f"Library save error: {e}")
+
+def add_to_library(script, caption, format_label, brief):
+    entries = load_library()
+    entries.append({
+        "id": str(uuid.uuid4())[:8],
+        "saved_at": datetime.utcnow().isoformat(),
+        "format": format_label,
+        "script": script,
+        "caption": caption,
+        "brief_snippet": brief[:200] if brief else ""
+    })
+    # Keep only the most recent MAX_LIBRARY_SIZE
+    if len(entries) > MAX_LIBRARY_SIZE:
+        entries = entries[-MAX_LIBRARY_SIZE:]
+    save_library(entries)
+    return len(entries)
+
+def get_examples_for_prompt(format_label, n=EXAMPLES_IN_PROMPT):
+    """Return N most relevant approved scripts formatted for prompt injection."""
+    entries = load_library()
+    if not entries:
+        return ""
+
+    # Prefer same format, fall back to any
+    same_format = [e for e in entries if format_label and format_label[:10].lower() in e.get("format", "").lower()]
+    pool = same_format if len(same_format) >= n else entries
+    selected = pool[-n:]  # most recent
+
+    section = "\n\n─────────────────────────────────────────\n"
+    section += "APPROVED EXAMPLES — scripts Honey has actually approved.\n"
+    section += "Study the voice, rhythm, and structure closely. Match this quality.\n"
+    section += "─────────────────────────────────────────\n\n"
+    for i, ex in enumerate(selected, 1):
+        section += f"APPROVED EXAMPLE {i} [{ex.get('format', '')}]\n"
+        section += f"[REEL SCRIPT]\n{ex.get('script', '')}\n\n"
+        if ex.get('caption'):
+            section += f"[CAPTION]\n{ex.get('caption', '')}\n\n"
+        section += "─────────────────────────────────────────\n\n"
+    return section
+
+
+# ── Feedback tracker ──────────────────────────────────────────────────────────
+
+def load_feedback():
+    try:
+        if os.path.exists(FEEDBACK_FILE):
+            with open(FEEDBACK_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Feedback load error: {e}")
+    return []
+
+def save_feedback_log(entries):
+    try:
+        with open(FEEDBACK_FILE, "w") as f:
+            json.dump(entries, f, indent=2)
+    except Exception as e:
+        print(f"Feedback save error: {e}")
+
+def log_feedback(instruction, format_label):
+    """Log a refinement instruction to build preference patterns."""
+    entries = load_feedback()
+    entries.append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "format": format_label,
+        "instruction": instruction
+    })
+    if len(entries) > MAX_FEEDBACK_SIZE:
+        entries = entries[-MAX_FEEDBACK_SIZE:]
+    save_feedback_log(entries)
+
+def get_feedback_for_prompt():
+    """Return recent feedback patterns for injection into refine prompt."""
+    entries = load_feedback()
+    if len(entries) < 3:
+        return ""
+    recent = entries[-10:]
+    instructions = [e["instruction"] for e in recent]
+    section = "\n\nHONEY'S RECENT FEEDBACK PATTERNS — things she has asked to change in past scripts:\n"
+    for instr in instructions:
+        section += f"• {instr}\n"
+    section += "\nLearn from these patterns. Avoid repeating what she consistently corrects.\n"
+    return section
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a script and caption writer for Honey Sheth — an Indian lifestyle, beauty, and travel content creator. You write EXCLUSIVELY in her voice, trained on 37 of her real scripts.
 
@@ -167,13 +293,13 @@ SUBFORMAT_LABELS = {
 
 FORMAT_KEYS = {"1": "immbt", "2": "event", "3": "collab"}
 VALID_SUBFORMAT_COUNTS = {"immbt": 3, "event": 3, "collab": 5}
-
-# Exact greeting words only — not prefix matches that catch "hey" in brand briefs
 GREETING_TRIGGERS = {"hi", "hello", "hey", "start", "hi!", "hello!", "hey!"}
 
 def is_greeting(text):
     return text.lower().strip().rstrip("!.,? ") in GREETING_TRIGGERS
 
+
+# ── Messaging helpers ─────────────────────────────────────────────────────────
 
 def send_message(to, body):
     try:
@@ -181,10 +307,8 @@ def send_message(to, body):
     except Exception as e:
         print(f"Send error: {e}")
 
-
 def send_in_chunks(to, text, chunk_size=1500):
     if not text:
-        print("send_in_chunks called with empty text — skipping")
         return
     text = text.strip()
     if not text:
@@ -192,7 +316,6 @@ def send_in_chunks(to, text, chunk_size=1500):
     if len(text) <= chunk_size:
         send_message(to, text)
         return
-    # Split on newlines near the boundary to avoid mid-word cuts
     chunks = []
     while len(text) > chunk_size:
         split_at = text.rfind("\n", 0, chunk_size)
@@ -207,6 +330,8 @@ def send_in_chunks(to, text, chunk_size=1500):
         time.sleep(0.5)
 
 
+# ── Media helpers ─────────────────────────────────────────────────────────────
+
 def download_media(media_url):
     r = requests.get(
         media_url,
@@ -216,20 +341,13 @@ def download_media(media_url):
     r.raise_for_status()
     return r.content
 
-
 def transcribe_audio(data, content_type):
     tmp_path = None
     try:
-        if "ogg" in content_type:
-            ext = ".ogg"
-        elif "mp4" in content_type or "m4a" in content_type:
-            ext = ".m4a"
-        elif "mpeg" in content_type or "mp3" in content_type:
-            ext = ".mp3"
-        elif "webm" in content_type:
-            ext = ".webm"
-        else:
-            ext = ".ogg"
+        ext = ".ogg"
+        if "mp4" in content_type or "m4a" in content_type: ext = ".m4a"
+        elif "mpeg" in content_type or "mp3" in content_type: ext = ".mp3"
+        elif "webm" in content_type: ext = ".webm"
 
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(data)
@@ -250,35 +368,50 @@ def transcribe_audio(data, content_type):
         else:
             print(f"Groq error: {response.text}")
             return ""
-
     except Exception as e:
         print(f"Transcription error: {e}")
         return ""
     finally:
         if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
+            try: os.unlink(tmp_path)
+            except: pass
 
 def extract_pdf(data):
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(data))
         return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
     except Exception as e:
-        print(f"PDF extract error: {e}")
+        print(f"PDF error: {e}")
         return ""
-
 
 def extract_docx(data):
     try:
         result = mammoth.extract_raw_text(io.BytesIO(data))
         return result.value.strip()
     except Exception as e:
-        print(f"DOCX extract error: {e}")
+        print(f"DOCX error: {e}")
         return ""
 
+def extract_brief(msg_body, media_url, content_type):
+    if media_url:
+        data = download_media(media_url)
+        ct = content_type.lower()
+        if "pdf" in ct:
+            return extract_pdf(data), False
+        elif "word" in ct or "docx" in ct or "officedocument" in ct:
+            return extract_docx(data), False
+        elif "image" in ct:
+            img_b64 = base64.b64encode(data).decode()
+            return f"[IMAGE:{img_b64}:{ct}]", False
+    return msg_body.strip(), False
+
+def looks_like_email(text):
+    signals = ["from:", "subject:", "dear honey", "hi honey", "hello honey",
+               "we would like", "we are reaching out", "collaboration",
+               "partnership", "deliverables", "compensation", "deadline",
+               "fwd:", "forwarded message", "------"]
+    lower = text.lower()
+    return sum(1 for s in signals if s in lower) >= 2
 
 def extract_email_brief(email_text):
     prompt = f"""This is a forwarded brand email. Extract only the relevant brief information for a content creator.
@@ -295,7 +428,6 @@ EMAIL:
 {email_text}
 
 No preamble. Just the extracted brief."""
-
     response = anthropic_client.messages.create(
         model="claude-opus-4-6",
         max_tokens=400,
@@ -304,41 +436,18 @@ No preamble. Just the extracted brief."""
     return response.content[0].text.strip()
 
 
-def extract_brief(msg_body, media_url, content_type):
-    if media_url:
-        data = download_media(media_url)
-        ct = content_type.lower()
-        if "pdf" in ct:
-            return extract_pdf(data), False
-        elif "word" in ct or "docx" in ct or "officedocument" in ct:
-            return extract_docx(data), False
-        elif "image" in ct:
-            img_b64 = base64.b64encode(data).decode()
-            return f"[IMAGE:{img_b64}:{ct}]", False
-    return msg_body.strip(), False
-
-
-def looks_like_email(text):
-    email_signals = [
-        "from:", "subject:", "dear honey", "hi honey", "hello honey",
-        "we would like", "we are reaching out", "collaboration",
-        "partnership", "deliverables", "compensation", "deadline",
-        "fwd:", "forwarded message", "------"
-    ]
-    lower = text.lower()
-    matches = sum(1 for s in email_signals if s in lower)
-    return matches >= 2
-
+# ── AI generation ─────────────────────────────────────────────────────────────
 
 def generate_concepts(brief_text, format_label):
+    examples = get_examples_for_prompt(format_label)
     prompt = f"""Based on this brand brief, generate 4 distinct creative concepts for an Instagram reel by Honey Sheth.
 
 CONTENT FORMAT: {format_label}
 
 BRAND BRIEF:
 {brief_text}
-
-Each concept should have a different angle, hook, or emotional approach.
+{examples}
+Each concept should have a different angle, hook, or emotional approach — consistent with Honey's approved voice above.
 
 Return EXACTLY this format:
 
@@ -367,6 +476,7 @@ No preamble. No notes. Just the 4 concepts."""
 
 def generate_script(brief_text, format_label, concept=None, extra_notes="", count=1):
     concept_line = f"\nCHOSEN CONCEPT TO EXECUTE:\n{concept}\n" if concept else ""
+    examples = get_examples_for_prompt(format_label)
 
     if count > 1:
         prompt = f"""Write {count} distinct Instagram reel script variations for Honey Sheth, each with a different angle or hook.
@@ -377,7 +487,7 @@ CONTENT FORMAT: {format_label}
 
 BRAND BRIEF:
 {brief_text}
-
+{examples}
 Format each variation exactly like this:
 
 VARIATION 1
@@ -411,7 +521,7 @@ No preamble. No notes."""
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": ct, "data": img_b64}},
-                    {"type": "text", "text": f"This is a brand brief image. Extract all info.\n\nCONTENT FORMAT: {format_label}\n{concept_line}\n{extra_notes}\n\nWrite a full Instagram reel script and caption in Honey Sheth's voice."}
+                    {"type": "text", "text": f"This is a brand brief image. Extract all info.\n\nCONTENT FORMAT: {format_label}\n{concept_line}\n{extra_notes}\n{examples}\nWrite a full Instagram reel script and caption in Honey Sheth's voice."}
                 ]
             }]
         else:
@@ -425,7 +535,7 @@ CONTENT FORMAT: {format_label}
 
 BRAND BRIEF:
 {brief_text}
-
+{examples}
 Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle — quieter, more reflective."""
         messages = [{"role": "user", "content": prompt}]
 
@@ -444,6 +554,9 @@ Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA sof
 
 
 def refine_script(brief_text, format_label, last_script, last_caption, instruction):
+    feedback_patterns = get_feedback_for_prompt()
+    examples = get_examples_for_prompt(format_label, n=2)
+
     prompt = f"""You previously wrote this script and caption for Honey Sheth.
 
 CONTENT FORMAT: {format_label}
@@ -459,7 +572,8 @@ PREVIOUS CAPTION:
 
 REFINEMENT REQUEST:
 {instruction}
-
+{feedback_patterns}
+{examples}
 Rewrite incorporating this feedback. Keep everything that worked. Only change what was asked. Stay in Honey's voice."""
 
     response = anthropic_client.messages.create(
@@ -476,6 +590,8 @@ Rewrite incorporating this feedback. Keep everything that worked. Only change wh
     return script, caption
 
 
+# ── Background workers ────────────────────────────────────────────────────────
+
 def send_script_and_caption(to, script, caption, multiple_raw=None):
     if multiple_raw:
         send_in_chunks(to, multiple_raw)
@@ -488,21 +604,17 @@ def send_script_and_caption(to, script, caption, multiple_raw=None):
     send_message(to,
         "─────────────────\n"
         "Reply with feedback to refine — text or voice note\n"
+        "Type *save* when you're happy with a version to teach me your voice\n"
         "Or send a new brief to start fresh."
     )
 
-
 def process_concepts_and_send(from_number, brief_text, format_label):
     done = {"value": False}
-
     def progress():
         time.sleep(15)
         if not done["value"]:
             send_message(from_number, "Thinking up concepts… almost there ✍️")
-
-    t = threading.Thread(target=progress)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=progress, daemon=True).start()
 
     try:
         concepts_text = generate_concepts(brief_text, format_label)
@@ -533,31 +645,25 @@ def process_concepts_and_send(from_number, brief_text, format_label):
     except Exception as e:
         done["value"] = True
         print(f"Concept error: {e}")
-        state = get_state(from_number)
-        set_state(from_number, {**state, "step": "idle"})
+        set_state(from_number, {**get_state(from_number), "step": "idle"})
         send_message(from_number, "Something went wrong generating concepts. Send your brief again.")
 
 
 def process_and_send(from_number, brief_text, format_label, concept=None, extra_notes="", count=1):
     done = {"value": False}
-
     def progress():
         time.sleep(20)
         if not done["value"]:
             send_message(from_number, "Still writing… almost there ✍️")
-
-    t = threading.Thread(target=progress)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=progress, daemon=True).start()
 
     try:
         if count > 1:
             raw_multiple, _, _ = generate_script(brief_text, format_label, concept, extra_notes, count=count)
             done["value"] = True
             if not raw_multiple:
-                state = get_state(from_number)
-                set_state(from_number, {**state, "step": "idle"})
-                send_message(from_number, "Something went wrong generating the scripts. Send your brief again.")
+                set_state(from_number, {**get_state(from_number), "step": "idle"})
+                send_message(from_number, "Something went wrong. Send your brief again.")
                 return
             state = get_state(from_number)
             set_state(from_number, {**state, "last_script": raw_multiple, "last_caption": "", "step": "idle"})
@@ -566,8 +672,7 @@ def process_and_send(from_number, brief_text, format_label, concept=None, extra_
             script, caption, error = generate_script(brief_text, format_label, concept, extra_notes)
             done["value"] = True
             if error:
-                state = get_state(from_number)
-                set_state(from_number, {**state, "step": "idle"})
+                set_state(from_number, {**get_state(from_number), "step": "idle"})
                 send_message(from_number, error)
                 return
             state = get_state(from_number)
@@ -576,28 +681,27 @@ def process_and_send(from_number, brief_text, format_label, concept=None, extra_
     except Exception as e:
         done["value"] = True
         print(f"Generate error: {e}")
-        state = get_state(from_number)
-        set_state(from_number, {**state, "step": "idle"})
+        set_state(from_number, {**get_state(from_number), "step": "idle"})
         send_message(from_number, "Something went wrong writing the script. Send your brief again.")
 
 
 def process_refine_and_send(from_number, instruction):
     state = get_state(from_number)
-    brief_text = state.get("brief", "")
+    brief_text   = state.get("brief", "")
     format_label = state.get("subformat_label", "Instagram Made Me Buy This (IMMBT series)")
-    last_script = state.get("last_script", "")
+    last_script  = state.get("last_script", "")
     last_caption = state.get("last_caption", "")
 
-    done = {"value": False}
+    # Log this feedback to build preference patterns
+    if instruction:
+        log_feedback(instruction, format_label)
 
+    done = {"value": False}
     def progress():
         time.sleep(20)
         if not done["value"]:
             send_message(from_number, "Refining… almost done ✍️")
-
-    t = threading.Thread(target=progress)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=progress, daemon=True).start()
 
     try:
         script, caption = refine_script(brief_text, format_label, last_script, last_caption, instruction)
@@ -624,6 +728,8 @@ def process_voice_brief_and_send(from_number, transcribed_text):
     send_message(from_number, f"🎤 Got your voice brief! Here's what I heard:\n\n_{transcribed_text}_\n\n" + FORMAT_MENU)
 
 
+# ── Webhook ───────────────────────────────────────────────────────────────────
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     from_number  = request.form.get("From", "")
@@ -637,43 +743,73 @@ def webhook():
     state = get_state(from_number)
     step  = state.get("step", "idle")
 
-    # ── Handle voice notes first ──────────────────────────────────────────────
+    # ── Voice notes ───────────────────────────────────────────────────────────
     if media_url and content_type and any(x in content_type.lower() for x in ["audio", "ogg", "mpeg", "mp4", "webm"]):
         resp.message("🎤 Transcribing your voice note…")
-
         def handle_voice():
             try:
                 data = download_media(media_url)
                 transcribed = transcribe_audio(data, content_type.lower())
-
                 if not transcribed:
                     send_message(from_number, "Couldn't make out what you said. Could you type it or try again?")
                     return
-
                 current_state = get_state(from_number)
-                current_step = current_state.get("step", "idle")
-                has_script = bool(current_state.get("last_script", ""))
-
-                print(f"Voice routing — step: {current_step}, has_script: {has_script}, text: {transcribed[:50]}")
-
+                current_step  = current_state.get("step", "idle")
+                has_script    = bool(current_state.get("last_script", ""))
                 if current_step == "awaiting_refine" or (current_step == "idle" and has_script):
                     send_message(from_number, f"🎤 Got your feedback:\n\n_{transcribed}_\n\nRefining now… give me 30 seconds.")
                     process_refine_and_send(from_number, transcribed)
                 else:
                     process_voice_brief_and_send(from_number, transcribed)
-
             except Exception as e:
-                print(f"Voice handle error: {e}")
-                send_message(from_number, "Something went wrong with your voice note. Please try again or type your message.")
+                print(f"Voice error: {e}")
+                send_message(from_number, "Something went wrong with your voice note. Please try again.")
+        threading.Thread(target=handle_voice, daemon=True).start()
+        return Response(str(resp), mimetype="text/xml")
 
-        thread = threading.Thread(target=handle_voice)
-        thread.daemon = True
-        thread.start()
+    # ── Save command ──────────────────────────────────────────────────────────
+    if lower == "save":
+        last_script  = state.get("last_script", "")
+        last_caption = state.get("last_caption", "")
+        format_label = state.get("subformat_label", "")
+        brief        = state.get("brief", "")
+        if not last_script:
+            resp.message("No script to save yet. Generate one first!")
+            return Response(str(resp), mimetype="text/xml")
+        count = add_to_library(last_script, last_caption, format_label, brief)
+        resp.message(
+            f"✅ Saved to your library! ({count} approved script{'s' if count != 1 else ''} total)\n\n"
+            f"Every future script will learn from your approved examples. "
+            f"The more you save, the closer it gets to your exact voice."
+        )
+        return Response(str(resp), mimetype="text/xml")
+
+    # ── Library command ───────────────────────────────────────────────────────
+    if lower in ["library", "my scripts", "examples"]:
+        entries  = load_library()
+        feedback = load_feedback()
+        if not entries:
+            resp.message(
+                "Your library is empty.\n\n"
+                "After generating a script you're happy with, type *save* to add it. "
+                "The bot learns from every script you approve."
+            )
+        else:
+            lines = [f"📚 *Your script library* — {len(entries)} approved script{'s' if len(entries) != 1 else ''}:\n"]
+            for e in entries[-10:]:
+                saved = e.get("saved_at", "")[:10]
+                fmt   = e.get("format", "unknown")
+                lines.append(f"• {saved} — {fmt}")
+            if feedback:
+                lines.append(f"\n🔁 {len(feedback)} feedback notes logged — these shape every refinement.")
+            resp.message("\n".join(lines))
         return Response(str(resp), mimetype="text/xml")
 
     # ── Global commands ───────────────────────────────────────────────────────
     if is_greeting(msg_body) and not media_url:
         set_state(from_number, {"step": "idle"})
+        library_count = len(load_library())
+        library_line  = f"\n\n📚 Your library has {library_count} approved script{'s' if library_count != 1 else ''} — I'm learning from {'them' if library_count != 1 else 'it'}." if library_count > 0 else ""
         resp.message(
             "👋 Hey! I'm Honey's script generator.\n\n"
             "Send me a brand brief and I'll write the reel script + caption in your voice.\n\n"
@@ -684,7 +820,8 @@ def webhook():
             "📧 Forwarded brand emails\n"
             "🎤 Voice notes\n"
             "✍️ Plain text\n\n"
-            "Just send it over!"
+            "*Commands:* save · library · help · cancel"
+            + library_line
         )
         return Response(str(resp), mimetype="text/xml")
 
@@ -696,8 +833,9 @@ def webhook():
             "3. Choose sub-format\n"
             "4. Pick a concept (1/2/3/4)\n"
             "5. Get reel script + caption\n"
-            "6. Reply with feedback (text or voice) to refine\n\n"
-            "*Commands:* hi, help, cancel"
+            "6. Refine with feedback (text or voice)\n"
+            "7. Type *save* when happy — teaches me your voice\n\n"
+            "*Commands:* save · library · help · cancel"
         )
         return Response(str(resp), mimetype="text/xml")
 
@@ -706,7 +844,7 @@ def webhook():
         resp.message("Cancelled. Send a new brief whenever you're ready!")
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Awaiting format selection ─────────────────────────────────────────────
+    # ── Awaiting format ───────────────────────────────────────────────────────
     if step == "awaiting_format":
         if lower not in ["1", "2", "3"]:
             resp.message("Please reply with 1, 2, or 3.\n\n" + FORMAT_MENU)
@@ -716,7 +854,7 @@ def webhook():
         resp.message(SUBFORMAT_MENUS[chosen_format])
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Awaiting sub-format selection ─────────────────────────────────────────
+    # ── Awaiting sub-format ───────────────────────────────────────────────────
     if step == "awaiting_subformat":
         chosen_format = state.get("format", "immbt")
         max_opts = VALID_SUBFORMAT_COUNTS.get(chosen_format, 3)
@@ -726,26 +864,24 @@ def webhook():
             return Response(str(resp), mimetype="text/xml")
         subformat_label = SUBFORMAT_LABELS[chosen_format][lower]
         brief_text = state.get("brief", "")
+        lib_count  = len(load_library())
+        learning_note = f" I'm drawing on {lib_count} of your approved scripts." if lib_count > 0 else ""
         set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating_concepts"})
-        resp.message(f"Got it — *{subformat_label}*\n\n💡 Generating concept ideas… give me 15 seconds.")
-        thread = threading.Thread(target=process_concepts_and_send, args=(from_number, brief_text, subformat_label))
-        thread.daemon = True
-        thread.start()
+        resp.message(f"Got it — *{subformat_label}*\n\n💡 Generating concept ideas… give me 15 seconds.{learning_note}")
+        threading.Thread(target=process_concepts_and_send, args=(from_number, brief_text, subformat_label), daemon=True).start()
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Awaiting concept selection ────────────────────────────────────────────
+    # ── Awaiting concept ──────────────────────────────────────────────────────
     if step == "awaiting_concept":
-        concepts = state.get("concepts", [])
-        brief_text = state.get("brief", "")
+        concepts     = state.get("concepts", [])
+        brief_text   = state.get("brief", "")
         format_label = state.get("subformat_label", "")
-        count = len(concepts)
+        count        = len(concepts)
 
         if lower == "all":
             set_state(from_number, {**state, "step": "generating"})
             resp.message(f"Writing all {count} variations… give me 60 seconds ✍️")
-            thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, None, "", count))
-            thread.daemon = True
-            thread.start()
+            threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, None, "", count), daemon=True).start()
             return Response(str(resp), mimetype="text/xml")
 
         valid = [str(i) for i in range(1, count + 1)]
@@ -757,38 +893,28 @@ def webhook():
         chosen_concept = concepts[int(lower) - 1]
         set_state(from_number, {**state, "chosen_concept": chosen_concept, "step": "generating"})
         resp.message("Love it! ✍️ Writing your script… give me 30 seconds.")
-        thread = threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, chosen_concept))
-        thread.daemon = True
-        thread.start()
+        threading.Thread(target=process_and_send, args=(from_number, brief_text, format_label, chosen_concept), daemon=True).start()
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Awaiting refine instruction ───────────────────────────────────────────
+    # ── Awaiting refine ───────────────────────────────────────────────────────
     if step == "awaiting_refine":
         if not msg_body:
             resp.message("What would you like to change? Type or send a voice note.")
             return Response(str(resp), mimetype="text/xml")
         set_state(from_number, {**state, "step": "generating"})
         resp.message("✍️ Refining… give me 30 seconds.")
-        thread = threading.Thread(target=process_refine_and_send, args=(from_number, msg_body))
-        thread.daemon = True
-        thread.start()
+        threading.Thread(target=process_refine_and_send, args=(from_number, msg_body), daemon=True).start()
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Idle with previous script: send feedback directly ────────────────────
-    # Fixed: short message while idle+has_script now goes straight to refine
-    # instead of making user send the feedback twice
+    # ── Idle with previous script — short message goes straight to refine ─────
     if step == "idle" and state.get("last_script") and not media_url:
-        if not is_greeting(msg_body) and lower not in ["help", "cancel"]:
-            # Only hijack as feedback if message is clearly feedback (short)
-            # AND doesn't look like a new brief (no brand/product signals)
+        if not is_greeting(msg_body) and lower not in ["help", "cancel", "save", "library", "my scripts", "examples"]:
             brief_signals = ["brief", "brand", "product", "collab", "campaign", "launch", "event", "partnership"]
             looks_like_brief = len(msg_body) > 300 or any(s in lower for s in brief_signals)
-            if not looks_like_brief and len(msg_body) < 300:
+            if not looks_like_brief:
                 set_state(from_number, {**state, "step": "generating"})
                 resp.message("✍️ Refining… give me 30 seconds.")
-                thread = threading.Thread(target=process_refine_and_send, args=(from_number, msg_body))
-                thread.daemon = True
-                thread.start()
+                threading.Thread(target=process_refine_and_send, args=(from_number, msg_body), daemon=True).start()
                 return Response(str(resp), mimetype="text/xml")
 
     # ── New brief ─────────────────────────────────────────────────────────────
@@ -796,7 +922,6 @@ def webhook():
         resp.message("Send me a brand brief — text, PDF, Word doc, image, or voice note!")
         return Response(str(resp), mimetype="text/xml")
 
-    # Guard against huge inputs
     if msg_body and len(msg_body) > 8000:
         resp.message("That brief is very long! Please trim it to the key details — brand, product, key claims, and deliverables.")
         return Response(str(resp), mimetype="text/xml")
@@ -812,7 +937,6 @@ def webhook():
         resp.message("Could not extract enough text. Please paste as text or send a clearer file.")
         return Response(str(resp), mimetype="text/xml")
 
-    # Check if it's a forwarded email
     if looks_like_email(brief_text) and not media_url:
         resp.message("📧 Looks like a brand email! Extracting the brief… one moment.")
         try:
@@ -821,7 +945,7 @@ def webhook():
             send_message(from_number, f"✅ Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
         except Exception as e:
             print(f"Email extract error: {e}")
-            send_message(from_number, "Couldn't auto-extract the brief — proceeding with the full email text.")
+            send_message(from_number, "Couldn't auto-extract — proceeding with the full email text.")
 
     set_state(from_number, {
         "step": "awaiting_format",
