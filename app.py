@@ -37,7 +37,7 @@ STATE_DB     = os.path.join(STORAGE_PATH, "honey_state")
 LIBRARY_FILE = os.path.join(STORAGE_PATH, "honey_library.json")
 FEEDBACK_FILE = os.path.join(STORAGE_PATH, "honey_feedback.json")
 
-print(f"Storage path: {STORAGE_PATH}")
+print(f"Storage path: {STORAGE_PATH} | Version: 2.0")
 
 state_lock   = threading.Lock()
 library_lock = threading.Lock()
