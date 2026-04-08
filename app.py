@@ -37,7 +37,7 @@ STATE_DB     = os.path.join(STORAGE_PATH, "honey_state")
 LIBRARY_FILE = os.path.join(STORAGE_PATH, "honey_library.json")
 FEEDBACK_FILE = os.path.join(STORAGE_PATH, "honey_feedback.json")
 
-print(f"Storage path: {STORAGE_PATH} | Version: 2.0")
+print(f"Storage path: {STORAGE_PATH}")
 
 state_lock   = threading.Lock()
 library_lock = threading.Lock()
@@ -436,6 +436,68 @@ No preamble. Just the extracted brief."""
     return response.content[0].text.strip()
 
 
+# ── Web search enrichment ─────────────────────────────────────────────────────
+
+def search_product_usps(query):
+    """Search for product details using Brave Search API. Returns snippets or empty string."""
+    brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+    if not brave_key:
+        return ""
+    try:
+        r = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": brave_key},
+            params={"q": query, "count": 5},
+            timeout=10
+        )
+        if r.status_code != 200:
+            print(f"Brave search error: {r.status_code}")
+            return ""
+        results = r.json().get("web", {}).get("results", [])
+        snippets = []
+        for res in results[:5]:
+            desc = res.get("description", "")
+            title = res.get("title", "")
+            if desc:
+                snippets.append(f"• {title}: {desc}")
+        return "\n".join(snippets)
+    except Exception as e:
+        print(f"Search error: {e}")
+        return ""
+
+
+def extract_brand_and_search(brief_text):
+    """Extract brand/product from brief and search for USPs. Returns enrichment text or empty string."""
+    if not os.environ.get("BRAVE_SEARCH_API_KEY", ""):
+        return ""
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content": (
+                f"Extract the brand name and product name from this brief.\n"
+                f"Return ONLY two lines: BRAND: [name] and PRODUCT: [name].\n"
+                f"If unclear, return BRAND: unknown PRODUCT: unknown.\n\n"
+                f"BRIEF: {brief_text[:600]}"
+            )}]
+        )
+        text = resp.content[0].text.strip()
+        brand_m = re.search(r'BRAND:\s*(.+)', text, re.IGNORECASE)
+        product_m = re.search(r'PRODUCT:\s*(.+)', text, re.IGNORECASE)
+        brand = brand_m.group(1).strip() if brand_m else ""
+        product = product_m.group(1).strip() if product_m else ""
+        if not brand or brand.lower() == "unknown":
+            return ""
+        query = f"{brand} {product} key ingredients benefits claims".strip()
+        snippets = search_product_usps(query)
+        if not snippets:
+            return ""
+        return f"\n\nWEB-FETCHED PRODUCT DETAILS for {brand} {product}:\n{snippets}\n(Use these facts to make the script specific and accurate.)"
+    except Exception as e:
+        print(f"Brief enrichment error: {e}")
+        return ""
+
+
 # ── AI generation ─────────────────────────────────────────────────────────────
 
 def generate_concepts(brief_text, format_label):
@@ -617,6 +679,14 @@ def process_concepts_and_send(from_number, brief_text, format_label):
     threading.Thread(target=progress, daemon=True).start()
 
     try:
+        # Auto-enrich brief with web-searched product USPs if Brave API key is set
+        enrichment = extract_brand_and_search(brief_text)
+        if enrichment:
+            brief_text = brief_text + enrichment
+            current_state = get_state(from_number)
+            set_state(from_number, {**current_state, "brief": brief_text})
+            send_message(from_number, "🔍 Found product details online — enriching your brief with real USPs...")
+
         concepts_text = generate_concepts(brief_text, format_label)
         done["value"] = True
         concepts = []
@@ -909,8 +979,9 @@ def webhook():
     # ── Idle with previous script — short message goes straight to refine ─────
     if step == "idle" and state.get("last_script") and not media_url:
         if not is_greeting(msg_body) and lower not in ["help", "cancel", "save", "library", "my scripts", "examples"]:
-            brief_signals = ["brief", "brand", "product", "collab", "campaign", "launch", "event", "partnership"]
-            looks_like_brief = len(msg_body) > 300 or any(s in lower for s in brief_signals)
+            # Only treat as a new brief if it explicitly says so or is very long
+            brief_signals = ["brand brief", "new brief", "collab brief", "new campaign", "new collab"]
+            looks_like_brief = len(msg_body) > 500 or any(s in lower for s in brief_signals)
             if not looks_like_brief:
                 set_state(from_number, {**state, "step": "generating"})
                 resp.message("✍️ Refining… give me 30 seconds.")
@@ -965,4 +1036,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
