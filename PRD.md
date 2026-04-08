@@ -2,22 +2,28 @@
 ## Honey Script Bot — WhatsApp Reel Script Generator
 
 **Version:** 2.0
-**Date:** 2025-01-31
+**Date:** 2025-07-09
 **Owner:** Honey Sheth
-**Status:** Live (Production — Railway deployment)
+**Status:** Live (Production — Railway deployment with persistent volume storage)
 
 ---
 
 ## 1. Overview
 
-Honey Script Bot is a personal WhatsApp-based AI assistant that generates Instagram Reel scripts and captions in the documented creative voice of Honey Sheth — an Indian lifestyle, beauty, and travel content creator. The bot accepts brand briefs in any format (plain text, PDF, Word document, image, voice note, or forwarded brand email), walks the user through a structured format selection flow, generates creative concept options, produces production-ready reel scripts with matching captions, and supports unlimited refinement cycles via text or voice feedback.
+Honey Script Bot is a personal, single-user WhatsApp-based AI assistant that generates production-ready Instagram Reel scripts and captions in the documented creative voice of Honey Sheth — an Indian lifestyle, beauty, and travel content creator. The system accepts brand briefs in any format they naturally arrive (plain text, PDF, Word document, image/screenshot, voice note, or forwarded brand email), walks the user through a structured format and sub-format selection flow, generates multiple creative concept options, produces full reel scripts with matching captions, and supports unlimited iterative refinement via text or voice feedback.
 
-**Version 2.0** introduces a **self-learning system**: Honey can approve scripts she's happy with, building a personal library of approved examples. These approved scripts are injected as few-shot examples into every future generation, causing the bot's output to converge on her exact voice over time. Refinement feedback is also logged persistently, allowing the model to learn from recurring correction patterns.
+**Version 2.0** introduces a **self-learning system**: Honey can approve scripts she's happy with by typing `save`, building a persistent personal library of approved examples. These approved scripts are injected as few-shot examples into every future generation, causing the bot's output to converge on her exact voice over time. Refinement feedback is also logged persistently, allowing the model to learn from recurring correction patterns and avoid repeating mistakes Honey has previously flagged.
 
-**Primary user:** Honey Sheth (single-user personal tool)
-**Interface:** WhatsApp (via Twilio)
-**AI backbone:** Anthropic Claude claude-opus-4-6 (script generation), Groq Whisper Large v3 (voice transcription)
-**Hosting:** Railway with persistent volume storage at `/data`
+| Attribute | Detail |
+|---|---|
+| **Primary user** | Honey Sheth (single-user personal tool) |
+| **Interface** | WhatsApp via Twilio WhatsApp Business API |
+| **AI backbone — generation** | Anthropic Claude claude-opus-4-6 (script, caption, concept, email extraction, brand identification) |
+| **AI backbone — brand extraction** | Anthropic Claude claude-haiku-4-5-20251001 (lightweight brand/product name extraction for web search) |
+| **AI backbone — transcription** | Groq Whisper Large v3 (voice note → text) |
+| **Web enrichment** | Brave Search API (optional — product USP lookup) |
+| **Hosting** | Railway with persistent volume mounted at `/data` (fallback: `/tmp`) |
+| **Persistent storage** | Python `shelve` for conversation state; JSON files for script library and feedback log |
 
 ---
 
@@ -28,12 +34,16 @@ As a content creator managing multiple brand collaborations per month, Honey fac
 - **Time-consuming** — manually drafting a script takes 30–60 minutes per brief, multiplied across 5–15 collaborations per month
 - **Inconsistent** — maintaining a precise creative voice across formats (IMMBT, event coverage, brand collaborations) is difficult under deadline pressure
 - **Friction-heavy** — briefs arrive in many formats (PDFs, forwarded emails, screenshots, WhatsApp voice memos) requiring manual extraction and reformatting before writing can even begin
-- **Iterative** — first drafts typically need 2–3 refinement rounds, each requiring context recall and re-reading
-- **Non-cumulative** — feedback given on past scripts doesn't carry forward; the same corrections get repeated
+- **Iterative** — first drafts typically need 2–3 refinement rounds, each requiring full context recall and re-reading of the original brief
+- **Non-cumulative** — feedback given on past scripts doesn't carry forward; the same corrections get repeated across sessions, and the system starts from zero every time
 
-### What v2.0 specifically addresses
+### What Version 2.0 Specifically Addresses
 
-Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **learning layer**: the system now accumulates approved scripts and refinement feedback over time, meaning every future script is informed by what Honey has already approved and what she's consistently asked to change. The bot gets better the more it's used.
+Version 1.0 solved the generation and refinement loop. Version 2.0 adds three critical layers:
+
+1. **Learning from approvals** — Approved scripts are stored in a persistent library (rolling window of 20) and injected as few-shot examples into every future generation, so the bot's voice converges on what Honey actually signs off on.
+2. **Learning from corrections** — Refinement feedback is logged persistently (rolling window of 30 entries) and injected into refinement prompts, so the bot learns from recurring correction patterns and stops making the same mistakes.
+3. **Web enrichment** — When a Brave Search API key is configured, the bot automatically extracts the brand and product name from the brief, searches for real product USPs, ingredients, and claims online, and enriches the brief before generation — producing scripts with specific, accurate product details instead of vague placeholders.
 
 **The goal:** eliminate manual scripting time, enable brief-to-filming in minutes, and build a system that learns Honey's voice with every interaction.
 
@@ -44,7 +54,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
 **Primary and sole user: Honey Sheth**
 
 | Attribute | Detail |
-|-----------|--------|
+|---|---|
 | Role | Indian lifestyle, beauty, and travel content creator |
 | Collaboration volume | 5–15 brand collaborations per month |
 | Brief sources | WhatsApp messages, forwarded emails, PDFs, voice memos, screenshots |
@@ -57,7 +67,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
 ## 4. User Goals
 
 | Goal | Priority |
-|------|----------|
+|---|---|
 | Generate a reel script + caption from any brand brief in under 60 seconds | P0 |
 | Receive content that sounds authentically like Honey — not generic AI | P0 |
 | Submit briefs in whatever format they arrive (no reformatting required) | P0 |
@@ -65,6 +75,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
 | Refine scripts via natural text or voice feedback without restarting | P1 |
 | Get a matching caption (different angle from the video) with every script | P1 |
 | Approve scripts to teach the bot her exact voice over time | P1 |
+| Have the bot enrich briefs with real product details from the web | P1 |
 | Use the tool entirely within WhatsApp — no app, no login, no dashboard | P2 |
 | Review her library of approved scripts and feedback history | P2 |
 
@@ -77,10 +88,10 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
 - Content scheduling, posting automation, or calendar integration
 - Script approval workflows with external stakeholders
 - Support for platforms other than Instagram Reels (YouTube Shorts, TikTok, etc.)
-- Real-time brand research, product lookup, or competitive analysis
-- Multi-language caption generation
+- Multi-language caption generation (Hindi is used organically as part of Honey's code-switching voice, not as a separate language mode)
 - Side-by-side draft comparison UI
 - Auto-format detection from brief content (format selection is menu-driven by design)
+- Persistent conversation history across sessions (only current flow state and library persist)
 
 ---
 
@@ -101,6 +112,10 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
           │ → extract structured   │
           │   brief via Claude     │
           │ → confirm to user      │
+          ├────────────────────────┤
+          │ [Voice note]           │
+          │ → transcribe via Groq  │
+          │ → confirm transcription│
           └────────────┬───────────┘
                        │
                        ▼
@@ -120,6 +135,13 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
                        │
                        ▼
           ┌────────────────────────┐
+          │ [Optional] Web search  │
+          │ enrichment for product │
+          │ USPs via Brave API     │
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
           │ Bot generates 4        │
           │ creative concepts      │
           │ (~15 sec)              │
@@ -135,7 +157,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
                   │        │
                   ▼        ▼
           ┌──────────┐ ┌──────────────┐
-          │ 1 script │ │ All 4        │
+          │ 1 script │ │ All N        │
           │ + caption│ │ variations   │
           │ (~30s)   │ │ (~60s)       │
           └────┬─────┘ └──────┬───────┘
@@ -156,10 +178,21 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
                        ▼
           ┌────────────────────────┐
           │ User types "save"      │
-          │ → Script added to      │
-          │   approved library     │
+          │ → Script + caption     │
+          │   added to approved    │
+          │   library              │
           │ → Future scripts learn │
           │   from this example    │
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │ Send new brief to      │
+          │ start fresh            │
+          │ — OR —                 │
+          │ Short message auto-    │
+          │ treated as refinement  │
+          │ of last script         │
           └────────────────────────┘
 ```
 
@@ -170,55 +203,11 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds a **lear
 ### 7.1 Brief Ingestion
 
 | ID | Requirement | Details |
-|----|-------------|---------|
-| FR-01 | Accept plain text briefs | Any WhatsApp text message treated as a brief when no active flow exists |
-| FR-02 | Accept and extract text from PDF attachments | Uses PyPDF2; returns extracted text for processing |
-| FR-03 | Accept and extract text from Word (.docx) attachments | Uses mammoth library for raw text extraction |
-| FR-04 | Accept image/screenshot attachments | Image is base64-encoded and sent to Claude claude-opus-4-6 via vision (multimodal) for text extraction and script generation in a single pass |
-| FR-05 | Accept voice note briefs | Audio downloaded from Twilio, transcribed via Groq Whisper Large v3, then treated as a text brief |
-| FR-06 | Detect forwarded brand emails | Heuristic detection based on signal keywords (≥2 of: "from:", "subject:", "dear honey", "deliverables", "collaboration", etc.) |
-| FR-07 | Extract structured brief from detected emails | Claude claude-opus-4-6 extracts: Brand, Product, Key Claims, Deliverables, Deadline, Extra Notes; confirmed back to user before proceeding |
-| FR-08 | Reject excessively long briefs | Briefs exceeding 8,000 characters are rejected with a message asking user to trim to key details |
-| FR-09 | Handle extraction failures gracefully | If PDF/DOCX/image extraction fails or yields <10 characters, user is asked to paste as plain text |
-| FR-10 | Support multiple audio formats | .ogg, .m4a, .mp3, .mp4, .webm — auto-detected from content type |
-
-### 7.2 Format & Sub-Format Selection
-
-| ID | Requirement | Details |
-|----|-------------|---------|
-| FR-11 | Present a 3-option format menu | After brief extraction: 1️⃣ IMMBT, 2️⃣ Event coverage, 3️⃣ Collaboration |
-| FR-12 | Present sub-format menu per category | IMMBT (3 options), Event (3 options), Collaboration (5 options) — see Section 7.2.1 |
-| FR-13 | Validate input at each selection step | Invalid input triggers re-prompt with the same menu; only valid numeric options accepted |
-| FR-14 | Map sub-format to descriptive label | Each sub-format resolves to a full descriptive label used in prompt construction (e.g., "IMMBT — viral hype check, sceptic who gets won over") |
-
-#### 7.2.1 Sub-Format Options
-
-**IMMBT (Instagram Made Me Buy This):**
-1. Single product discovery
-2. Viral / hype check
-3. Sceptic won over
-
-**Event coverage:**
-1. Brand booth or launch
-2. Destination / travel day
-3. Community or group event
-
-**Collaboration:**
-1. Routine or tutorial
-2. Personal narrative
-3. Multi-product or haul
-4. Gifting or occasion
-5. Platform or retail
-
-### 7.3 Concept Generation
-
-| ID | Requirement | Details |
-|----|-------------|---------|
-| FR-15 | Generate 4 distinct creative concepts per brief | Each concept has a different angle, hook, or emotional approach; generated by Claude claude-opus-4-6 with system prompt |
-| FR-16 | Inject approved library examples into concept generation | Up to 3 most relevant approved scripts (matching format preferred) included in prompt as few-shot examples |
-| FR-17 | Present concepts as numbered options | Displayed as 1️⃣–4️⃣ with title and 2-sentence description each |
-| FR-18 | Allow single concept selection | User replies 1–4 to select one concept for script generation |
-| FR-19 | Allow "all" option | User replies "all" to receive all 4 concepts written as full script variations |
-| FR-20 | Parse concept text dynamically | Regex-based extraction of CONCEPT N patterns; handles variable concept counts |
-| FR-21 | Show progress indicator | If concept generation exceeds 15 seconds, send "Thinking up concepts… almost there ✍️" |
-| FR-22 | Handle concept generation failure | If parsing fails or API errors, user is
+|---|---|---|
+| FR-01 | Accept plain text briefs | Any WhatsApp text message is treated as a brief when no active flow exists and no prior script is loaded. Messages under 500 characters when a prior script exists are treated as refinement feedback instead. |
+| FR-02 | Accept and extract text from PDF attachments | Uses PyPDF2 to read all pages and concatenate extracted text. Handles extraction failures gracefully. |
+| FR-03 | Accept and extract text from Word (.docx) attachments | Uses mammoth library for raw text extraction from .docx files. Content type detection includes "word", "docx", and "officedocument" variants. |
+| FR-04 | Accept image/screenshot attachments | Image is base64-encoded and sent to Claude claude-opus-4-6 via multimodal vision input. The image is processed inline — text extraction and script generation happen in a single API call during the generation step. |
+| FR-05 | Accept voice note briefs | Audio is downloaded from Twilio media URL, transcribed via Groq Whisper Large v3, then treated as a text brief. Transcription is echoed back to the user for confirmation before proceeding to format selection. |
+| FR-06 | Detect forwarded brand emails | Heuristic detection based on signal keyword count: if ≥2 of the following appear in the text — "from:", "subject:", "dear honey", "hi honey", "hello honey", "we would like", "we are reaching out", "collaboration", "partnership", "deliverables", "compensation", "deadline", "fwd:", "forwarded message", "------" — the message is classified as a forwarded email. |
+| FR-07 | Extract structured brief from detected emails | Claude claude-opus-4-6 extracts a structured brief in the format: Brand, Product, Key Claims, Deliverables, Deadline, Extra Notes. Extracted brief is sent back to the user for
