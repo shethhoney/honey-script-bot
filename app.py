@@ -786,6 +786,37 @@ def process_refine_and_send(from_number, instruction):
         send_message(from_number, "Something went wrong refining. Send your feedback again.")
 
 
+def process_brief_and_send(from_number, msg_body, media_url, content_type, prev_last_script, prev_last_caption):
+    try:
+        brief_text, _ = extract_brief(msg_body, media_url, content_type)
+    except Exception as e:
+        print(f"Extract error: {e}")
+        send_message(from_number, "Could not read that file. Please paste the brief as plain text.")
+        return
+
+    if not brief_text or len(brief_text) < 10:
+        send_message(from_number, "Could not extract enough text. Please paste as text or send a clearer file.")
+        return
+
+    if looks_like_email(brief_text) and not media_url:
+        send_message(from_number, "📧 Looks like a brand email! Extracting the brief… one moment.")
+        try:
+            extracted = extract_email_brief(brief_text)
+            brief_text = extracted
+            send_message(from_number, f"✅ Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
+        except Exception as e:
+            print(f"Email extract error: {e}")
+            send_message(from_number, "Couldn't auto-extract — proceeding with the full email text.")
+
+    set_state(from_number, {
+        "step": "awaiting_format",
+        "brief": brief_text,
+        "last_script": prev_last_script,
+        "last_caption": prev_last_caption
+    })
+    send_message(from_number, "Got your brief!\n\n" + FORMAT_MENU)
+
+
 def process_voice_brief_and_send(from_number, transcribed_text):
     state = get_state(from_number)
     set_state(from_number, {
@@ -997,34 +1028,12 @@ def webhook():
         resp.message("That brief is very long! Please trim it to the key details — brand, product, key claims, and deliverables.")
         return Response(str(resp), mimetype="text/xml")
 
-    try:
-        brief_text, _ = extract_brief(msg_body, media_url, content_type)
-    except Exception as e:
-        print(f"Extract error: {e}")
-        resp.message("Could not read that file. Please paste the brief as plain text.")
-        return Response(str(resp), mimetype="text/xml")
-
-    if not brief_text or len(brief_text) < 10:
-        resp.message("Could not extract enough text. Please paste as text or send a clearer file.")
-        return Response(str(resp), mimetype="text/xml")
-
-    if looks_like_email(brief_text) and not media_url:
-        resp.message("📧 Looks like a brand email! Extracting the brief… one moment.")
-        try:
-            extracted = extract_email_brief(brief_text)
-            brief_text = extracted
-            send_message(from_number, f"✅ Here's what I extracted:\n\n{extracted}\n\nProceeding to format selection...")
-        except Exception as e:
-            print(f"Email extract error: {e}")
-            send_message(from_number, "Couldn't auto-extract — proceeding with the full email text.")
-
-    set_state(from_number, {
-        "step": "awaiting_format",
-        "brief": brief_text,
-        "last_script": state.get("last_script", ""),
-        "last_caption": state.get("last_caption", "")
-    })
-    resp.message("Got your brief!\n\n" + FORMAT_MENU)
+    resp.message("📨 Got it! Reading your brief…")
+    threading.Thread(
+        target=process_brief_and_send,
+        args=(from_number, msg_body, media_url, content_type, state.get("last_script", ""), state.get("last_caption", "")),
+        daemon=True
+    ).start()
     return Response(str(resp), mimetype="text/xml")
 
 
