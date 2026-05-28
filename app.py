@@ -42,9 +42,83 @@ print(f"Storage path: {STORAGE_PATH}")
 state_lock   = threading.Lock()
 library_lock = threading.Lock()
 
-MAX_LIBRARY_SIZE  = 20   # rolling window of approved scripts
+MAX_LIBRARY_SIZE  = 200  # cap to avoid giant GitHub commits
 MAX_FEEDBACK_SIZE = 30   # rolling window of feedback entries
 EXAMPLES_IN_PROMPT = 3   # how many approved scripts to inject per generation
+
+# ── GitHub-backed library cache ───────────────────────────────────────────────
+_library_cache      = None   # list[dict] | None
+_library_cache_time = 0.0
+LIBRARY_CACHE_TTL   = 300    # seconds before re-fetching from GitHub
+
+def _gh_headers():
+    token = os.environ.get("GITHUB_LIBRARY_TOKEN", "")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+def _gh_repo():
+    return os.environ.get("GITHUB_REPO", "shethhoney/honey-script-bot")
+
+def _gh_path():
+    return "honey_library.json"
+
+def _load_from_github():
+    """Fetch honey_library.json from GitHub. Returns (entries, sha) or (None, None)."""
+    token = os.environ.get("GITHUB_LIBRARY_TOKEN", "")
+    if not token:
+        return None, None
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{_gh_repo()}/contents/{_gh_path()}",
+            headers=_gh_headers(), timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            return json.loads(content), data["sha"]
+        print(f"GitHub library fetch status: {r.status_code}")
+        return [], None
+    except Exception as e:
+        print(f"GitHub library load error: {e}")
+        return None, None
+
+def _save_to_github(entries):
+    """Write entries to GitHub. Returns True on success."""
+    token = os.environ.get("GITHUB_LIBRARY_TOKEN", "")
+    if not token:
+        return False
+    try:
+        # Get current SHA (needed for update)
+        r = requests.get(
+            f"https://api.github.com/repos/{_gh_repo()}/contents/{_gh_path()}",
+            headers=_gh_headers(), timeout=10
+        )
+        sha = r.json().get("sha") if r.status_code == 200 else None
+
+        content_b64 = base64.b64encode(
+            json.dumps(entries, indent=2, ensure_ascii=False).encode()
+        ).decode()
+        payload = {
+            "message": f"library: {len(entries)} approved scripts [bot]",
+            "content": content_b64,
+            "branch": "main",
+        }
+        if sha:
+            payload["sha"] = sha
+
+        r = requests.put(
+            f"https://api.github.com/repos/{_gh_repo()}/contents/{_gh_path()}",
+            headers=_gh_headers(), json=payload, timeout=15
+        )
+        ok = r.status_code in [200, 201]
+        if not ok:
+            print(f"GitHub library save error {r.status_code}: {r.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"GitHub library save error: {e}")
+        return False
 
 
 # ── State (conversation flow) ─────────────────────────────────────────────────
@@ -63,22 +137,52 @@ def set_state(number, data):
 # ── Script library ────────────────────────────────────────────────────────────
 
 def load_library():
+    """Return script library. Order of precedence: in-memory cache → GitHub → local file."""
+    global _library_cache, _library_cache_time
     with library_lock:
-        try:
-            if os.path.exists(LIBRARY_FILE):
-                with open(LIBRARY_FILE, "r") as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"Library load error: {e}")
-        return []
+        # 1. Serve from cache if fresh
+        if _library_cache is not None and (time.time() - _library_cache_time) < LIBRARY_CACHE_TTL:
+            return list(_library_cache)
+
+        # 2. Try GitHub (primary permanent storage)
+        entries, _ = _load_from_github()
+
+        # 3. Fall back to local file if GitHub unavailable
+        if entries is None:
+            try:
+                if os.path.exists(LIBRARY_FILE):
+                    with open(LIBRARY_FILE, "r") as f:
+                        entries = json.load(f)
+                else:
+                    entries = []
+            except Exception as e:
+                print(f"Local library load error: {e}")
+                entries = _library_cache or []
+
+        _library_cache      = list(entries)
+        _library_cache_time = time.time()
+        return list(entries)
+
+def _save_library_background(entries):
+    """Background: write to GitHub + local. Updates cache on success."""
+    global _library_cache, _library_cache_time
+    ok = _save_to_github(entries)
+    if ok:
+        print(f"Library saved to GitHub ({len(entries)} entries).")
+    # Always save locally as backup regardless of GitHub result
+    try:
+        with open(LIBRARY_FILE, "w") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Local library backup save error: {e}")
 
 def save_library(entries):
+    """Update cache immediately, persist to GitHub + local in background."""
+    global _library_cache, _library_cache_time
     with library_lock:
-        try:
-            with open(LIBRARY_FILE, "w") as f:
-                json.dump(entries, f, indent=2)
-        except Exception as e:
-            print(f"Library save error: {e}")
+        _library_cache      = list(entries)
+        _library_cache_time = time.time()
+    threading.Thread(target=_save_library_background, args=(list(entries),), daemon=True).start()
 
 def add_to_library(script, caption, format_label, brief):
     entries = load_library()
