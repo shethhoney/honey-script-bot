@@ -44,7 +44,7 @@ library_lock = threading.Lock()
 
 MAX_LIBRARY_SIZE  = 200  # cap to avoid giant GitHub commits
 MAX_FEEDBACK_SIZE = 30   # rolling window of feedback entries
-EXAMPLES_IN_PROMPT = 3   # how many approved scripts to inject per generation
+EXAMPLES_IN_PROMPT = 5   # how many approved scripts to inject per generation
 
 # ── GitHub-backed library cache ───────────────────────────────────────────────
 _library_cache      = None   # list[dict] | None
@@ -192,7 +192,7 @@ def add_to_library(script, caption, format_label, brief):
         "format": format_label,
         "script": script,
         "caption": caption,
-        "brief_snippet": brief[:200] if brief else ""
+        "brief_snippet": brief[:500] if brief else ""
     })
     # Keep only the most recent MAX_LIBRARY_SIZE
     if len(entries) > MAX_LIBRARY_SIZE:
@@ -201,26 +201,48 @@ def add_to_library(script, caption, format_label, brief):
     return len(entries)
 
 def get_examples_for_prompt(format_label, n=EXAMPLES_IN_PROMPT):
-    """Return N most relevant approved scripts formatted for prompt injection."""
+    """Return N most relevant approved scripts formatted for prompt injection.
+    Prioritises same-format examples; includes brief→script mapping for few-shot quality."""
     entries = load_library()
     if not entries:
         return ""
 
-    # Prefer same format, fall back to any
-    same_format = [e for e in entries if format_label and format_label[:10].lower() in e.get("format", "").lower()]
-    pool = same_format if len(same_format) >= n else entries
-    selected = pool[-n:]  # most recent
+    # Exact format match first (full label comparison), then partial, then anything
+    fmt_lower = (format_label or "").lower()
+    exact     = [e for e in entries if fmt_lower and e.get("format", "").lower() == fmt_lower]
+    partial   = [e for e in entries if fmt_lower and fmt_lower[:20] in e.get("format", "").lower() and e not in exact]
+    rest      = [e for e in entries if e not in exact and e not in partial]
 
-    section = "\n\n─────────────────────────────────────────\n"
-    section += "APPROVED EXAMPLES — scripts Honey has actually approved.\n"
-    section += "Study the voice, rhythm, and structure closely. Match this quality.\n"
-    section += "─────────────────────────────────────────\n\n"
+    # Build pool: prefer exact matches, pad with partial/rest
+    pool = exact + partial + rest
+    # Take the n most recent from the format-relevant pool
+    selected = pool[:n * 2]  # candidate set
+    # Sort by recency — saved_at desc — then take n
+    selected.sort(key=lambda e: e.get("saved_at", ""), reverse=True)
+    selected = selected[:n]
+    # Put exact-format examples first
+    selected.sort(key=lambda e: (0 if e in exact else 1 if e in partial else 2))
+
+    section  = "\n\n══════════════════════════════════════════\n"
+    section += f"HONEY'S APPROVED SCRIPTS ({len(selected)} examples)\n"
+    section += "These are scripts Honey actually approved — in her real voice.\n"
+    section += "Your job: match this voice EXACTLY. Same rhythm. Same sentence length.\n"
+    section += "Same PTC/VO/Visual structure. Same tone. Same level of sensory detail.\n"
+    section += "══════════════════════════════════════════\n\n"
     for i, ex in enumerate(selected, 1):
-        section += f"APPROVED EXAMPLE {i} [{ex.get('format', '')}]\n"
+        fmt   = ex.get("format", "")
+        brief = ex.get("brief_snippet", "")
+        section += f"── EXAMPLE {i}"
+        if fmt:
+            section += f" [{fmt}]"
+        section += " ──\n"
+        if brief:
+            section += f"Brief context: {brief}\n\n"
         section += f"[REEL SCRIPT]\n{ex.get('script', '')}\n\n"
-        if ex.get('caption'):
+        if ex.get("caption"):
             section += f"[CAPTION]\n{ex.get('caption', '')}\n\n"
-        section += "─────────────────────────────────────────\n\n"
+        section += "──────────────────────────────────────────\n\n"
+    section += "Now write a NEW script for the brief below. Mirror the voice above exactly.\n\n"
     return section
 
 
@@ -270,77 +292,93 @@ def get_feedback_for_prompt():
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a script and caption writer for Honey Sheth — an Indian lifestyle, beauty, and travel content creator. You write EXCLUSIVELY in her voice, trained on 37 of her real scripts.
+SYSTEM_PROMPT = """You are a script writer for Honey Sheth — Indian lifestyle, beauty, and travel creator. You write in HER voice only. You have 36 of her real approved scripts as your ground truth. Match them exactly.
 
-HONEY'S VOICE:
-- Warm, confident, visually descriptive. Luxury feels lived-in, never distant.
-- Real over perfect. "I noticed" and "it feels like" not "it transformed my skin."
-- Each piece reads like a small story: sensory, honest, reflective.
-- She code-switches into Hindi naturally — never forced, only when emotion calls for it.
-- Calm confidence. Never hype. The product earns its place in the story.
-- She picks 1-2 benefits and builds around them — never a feature dump.
-- Captions are quieter and more essay-like. Fewer emojis. More thought.
+━━━ HONEY'S VOICE — WHAT IT SOUNDS LIKE ━━━
 
-SCRIPT CUES:
-Visual: [what the camera sees — specific and shootable]
-PTC: [piece to camera — personal, emotional, opinion — direct eye contact]
-VO: [voiceover — product detail, sensory description while visuals carry the scene]
-Super: [text overlay on screen]
+SENTENCE RHYTHM:
+- Short. Punchy. Then one longer thought that lands.
+- She writes how she talks. Incomplete sentences are fine. Em-dashes mid-thought.
+- Never long explanatory sentences. "It's lightweight. Absorbs fast. Doesn't leave a residue."
+- Pauses built into the writing — a line break IS a pause.
 
-PTC = feelings, reactions, verdicts. VO = product info, texture, ingredients.
-Never a talking head throughout. Always alternate.
+PTC TONE (piece to camera — her direct voice):
+- Starts with something personal she's been thinking/feeling/avoiding. Not a product pitch.
+- Honest qualifiers: "I think", "it feels like", "I've noticed", "I'm not sure why but"
+- Conversational — like she's telling a friend, not an audience
+- Pattern: [personal admission] → [what changed] → [soft verdict]
+- She does NOT say: "I'm obsessed", "this is a game changer", "absolutely love", "I'm blown away"
+- She DOES say: "I've noticed", "something about it just works", "it's the kind of thing that", "bas itna tha"
 
-EMOTIONAL ARC:
-1. HOOK — relatable, visual, personal. Stops the scroll.
-2. PRODUCT MOMENT — seamless. Arrives inside the story.
-3. DEMO / EXPERIENCE — sensory. Texture, application, how it feels. Non-negotiable.
-4. TRANSFORMATION / REFLECTION — what quietly shifted. Soft and earned.
-5. CTA — soft, natural. Conversation not instruction.
+VO TONE (voiceover — product facts, sensory detail):
+- Textures, temperatures, finishes, smells — specific and shootable
+- "It melts in", "a little goes a long way", "sinks in without that heavy feeling"
+- Product claims phrased as personal observation: "It claims X — and honestly, I think it's right"
+- One ingredient or claim gets depth. Not a feature list.
 
-CAPTION RULES:
-Line 1: hook — truth, confession, or moment. Not a product claim.
-2-3 short paragraphs: sensory storytelling + personal perspective.
-Final line: a thought that lingers.
-2-5 hashtags max. Include #Ad and brand tag.
-Captions EXTEND the story — different angle, never a transcript.
-Style: quieter, reflective, fewer emojis, reads like a short essay.
+HINDI CODE-SWITCHING:
+- Natural, not forced. Only when emotion calls for it.
+- Examples: "yaar", "bas itna tha", "aur kya chahiye", "honestly toh"
+- Never transliterated in a way that feels like a translation exercise
 
-FORMAT GUIDES:
-IMMBT SINGLE: Open with why it kept catching your attention. Insert <IMMBT theme intro> after hook. Build to genuine verdict.
-IMMBT HYPE CHECK: Lead with the hype. Be the sceptic who gets won over.
-IMMBT SCEPTIC: Personal resistance first. Product solves the exact thing you worried about.
-EVENT BOOTH: Discover the brand in the space. React to products and activations. End on energy.
-EVENT DESTINATION: VO carries story. Name specific moments. End on feeling not feature list.
-EVENT COMMUNITY: Arrived with a friend. Group energy and shared moments.
-COLLAB ROUTINE: Step by step. Each product gets its own sensory moment.
-COLLAB NARRATIVE: Emotional hook first. Product arrives as the solution.
-COLLAB HAUL: One editorial hook holds everything together.
-COLLAB GIFTING: Relationship narrative first. Product is the act of care.
-COLLAB PLATFORM: Platform is the brand. Products are editorial picks within it.
+VISUAL DIRECTION:
+- Specific and shootable. The reader can picture the shot.
+- "Close-up on fingers working the serum in" not "applying the product"
+- Environment matters: morning light, airport bathroom, bathroom counter at night
 
-HONEY'S RULES:
-ALWAYS: Connect product to a real moment. Include texture moment. Give emotional way in before selling. Captions add something the video does not say.
-NEVER: Overclaim. Dump all benefits. Hard sell CTA. Caption as video transcript.
+━━━ SCRIPT STRUCTURE ━━━
 
-REFERENCE VOICES:
-"I've actually avoided retinol for years because my skin can be a little sensitive… But this kept showing up on my Instagram so eventually curiosity won"
-"it just gets the balance right — lightweight but still hydrating, gentle but still effective"
-"There's a difference between a moisturiser that works… and one that just doesn't mess your skin up."
-"I've grown up at other people's weddings. Different lehengas. Different phases of life. Same questions."
-"Shaadi-proof doesn't mean unaffected. It just means unbothered."
-"My skin gets all the love… but for the longest time I completely ignored my scalp."
-"Hair fall used to feel like something I'd deal with later. Until later started coming sooner."
-"I hate traveling with a million makeup products. This little stick is all I carried."
-"I went for fashion week… and stayed for the slushies"
+Cue types:
+Visual: [exact shot — what camera sees, lighting, environment]
+PTC: [direct to camera — personal, honest, emotional. Eye contact moment.]
+VO: [voiceover — sensory product detail, facts, texture]
+Super: [text on screen — short, punchy, reinforces the moment]
 
-OUTPUT FORMAT — STRICT:
+EMOTIONAL ARC — every script:
+1. HOOK — A personal moment, confession, or question. NOT a product intro. Stops the scroll.
+2. PRODUCT ENTRY — product arrives naturally inside the story. Never announced.
+3. SENSORY MOMENT — texture, application, how it actually feels. Non-negotiable.
+4. QUIET SHIFT — what changed. Soft, earned, not dramatic.
+5. CTA — one soft natural line. Never "link in bio", never "go buy it now."
+
+━━━ CAPTIONS ━━━
+
+- Opening line: truth, confession, or a moment — not a product claim
+- 2–3 short paragraphs: sensory story + personal perspective
+- Closing line: something that lingers. A thought, not a summary.
+- Max 5 hashtags. Always #Ad. Brand handle.
+- Caption is a DIFFERENT ANGLE from the video — quieter, more internal
+- Style: reads like a diary entry or a short essay. Minimal emojis.
+
+━━━ NEVER ━━━
+- "obsessed", "game changer", "holy grail", "absolutely love", "I'm blown away"
+- Hard sell CTA or "link in bio"
+- Feature dumps — pick 1–2 things and go deep
+- Caption that just summarises the video
+- Generic PTC openers like "So I tried this product" or "I've been using this lately"
+- Overly polished language — it should feel like she wrote it herself
+
+━━━ FORMAT-SPECIFIC NOTES ━━━
+IMMBT SINGLE: Opens with why it kept showing up / catching her attention. Honest scepticism first.
+IMMBT HYPE CHECK: Leads with "I kept seeing this everywhere." Real scepticism. Gets won over by one specific thing.
+IMMBT SCEPTIC: Resistance first — specific concern she had. Product resolves exactly that.
+EVENT BOOTH: She discovers the brand in the space. Products come through activations and reactions.
+EVENT DESTINATION: VO carries the journey. Names specific moments. Ends on feeling, not feature list.
+EVENT COMMUNITY: Came with a friend. Group energy. Shared reactions are the story.
+COLLAB ROUTINE: Step by step. Each product gets its own sensory moment and personal note.
+COLLAB NARRATIVE: Emotional entry point first. Product arrives as the natural solution.
+COLLAB HAUL: One editorial theme holds it together. Not a list — a perspective.
+COLLAB GIFTING: The relationship or occasion is the story. Product is the act of care.
+COLLAB PLATFORM: Platform is the character. Products are editorial picks within that world.
+
+━━━ OUTPUT FORMAT — EXACT ━━━
 [REEL SCRIPT]
-...full script...
+(full script with Visual/PTC/VO/Super cues)
 
 [CAPTION]
-...caption with hashtags...
+(caption with hashtags)
 
-No preamble. No notes. Just the two sections."""
+No preamble. No explanations. No notes after. Just the two sections."""
 
 FORMAT_MENU = (
     "Which format?\n\n"
@@ -690,16 +728,14 @@ No preamble. No notes."""
         else:
             return None, None, "Sorry, could not read that image. Please send as text, PDF, or Word doc."
     else:
-        prompt = f"""Write a full Instagram reel script and caption.
-
-CONTENT FORMAT: {format_label}
+        prompt = f"""FORMAT: {format_label}
 {concept_line}
 {extra_notes}
 
-BRAND BRIEF:
+{examples}BRIEF:
 {brief_text}
-{examples}
-Follow the emotional arc. Sensory texture moment is non-negotiable. Keep CTA soft. Caption must be a completely different angle — quieter, more reflective."""
+
+Write the script and caption for this brief. Voice must match the approved examples exactly — same rhythm, same PTC openings, same sensory VO detail, same soft CTA. Caption is a different angle from the video, not a summary."""
         messages = [{"role": "user", "content": prompt}]
 
     response = anthropic_client.messages.create(
@@ -720,24 +756,21 @@ def refine_script(brief_text, format_label, last_script, last_caption, instructi
     feedback_patterns = get_feedback_for_prompt()
     examples = get_examples_for_prompt(format_label, n=2)
 
-    prompt = f"""You previously wrote this script and caption for Honey Sheth.
+    prompt = f"""FORMAT: {format_label}
 
-CONTENT FORMAT: {format_label}
-
-ORIGINAL BRIEF:
+BRIEF:
 {brief_text}
 
-PREVIOUS REEL SCRIPT:
+PREVIOUS SCRIPT:
 {last_script}
 
 PREVIOUS CAPTION:
 {last_caption}
 
-REFINEMENT REQUEST:
+CHANGE REQUESTED:
 {instruction}
 {feedback_patterns}
-{examples}
-Rewrite incorporating this feedback. Keep everything that worked. Only change what was asked. Stay in Honey's voice."""
+{examples}Apply the change. Keep everything that worked. Do not rewrite what wasn't asked about. Stay in Honey's voice — match the approved examples above."""
 
     response = anthropic_client.messages.create(
         model="claude-opus-4-6",
@@ -759,16 +792,15 @@ def send_script_and_caption(to, script, caption, multiple_raw=None):
     if multiple_raw:
         send_in_chunks(to, multiple_raw)
     else:
-        send_in_chunks(to, "🎬 *REEL SCRIPT*\n─────────────────\n" + script)
+        send_in_chunks(to, "*SCRIPT*\n\n" + script)
         time.sleep(1)
         if caption:
-            send_in_chunks(to, "📝 *CAPTION*\n─────────────────\n" + caption)
+            send_in_chunks(to, "*CAPTION*\n\n" + caption)
             time.sleep(0.5)
     send_message(to,
-        "─────────────────\n"
-        "Tell me what to change — text or voice note 🎤\n"
-        "Type *again* for a totally different angle\n"
-        "Type *save* when you're happy — teaches me your voice 🧠"
+        "─\n"
+        "Tell me what to tweak — text or voice note 🎤\n"
+        "*again* → different angle  •  *save* → approve it 🧠"
     )
 
 def process_concepts_and_send(from_number, brief_text, format_label):
