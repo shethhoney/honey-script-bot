@@ -65,7 +65,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 
 | ID | Requirement | Details |
 |---|---|---|
-| FR-01 | **Accept plain text briefs** | Any WhatsApp text message is treated as a new brief when no active flow exists and no prior script is loaded. Messages under 500 characters when a prior script exists are treated as refinement feedback instead (see FR-33). Briefs exceeding 8,000 characters are rejected with a prompt to trim. |
+| FR-01 | **Accept plain text briefs** | Any WhatsApp text message is treated as a new brief when no active flow exists and no prior script is loaded. Messages under 500 characters when a prior script exists are treated as refinement feedback instead (see FR-37). Briefs exceeding 8,000 characters are rejected with a prompt to trim. |
 | FR-02 | **Accept and extract text from PDF attachments** | Uses PyPDF2 to read all pages and concatenate extracted text. Handles extraction failures gracefully with a fallback message asking the user to paste as plain text. |
 | FR-03 | **Accept and extract text from Word (.docx) attachments** | Uses mammoth library for raw text extraction from .docx files. Content type detection covers `word`, `docx`, and `officedocument` MIME type variants. |
 | FR-04 | **Accept image/screenshot attachments** | Image is base64-encoded and passed to Claude claude-opus-4-6 via multimodal vision input during the generation step. The image is stored in the brief field as a `[IMAGE:base64:content_type]` token and processed inline — text extraction and script generation happen in a single API call. If the image token cannot be parsed at generation time, the user is asked to resend in another format. |
@@ -82,26 +82,22 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 | FR-10 | **Automatic brand and product extraction** | When a Brave Search API key is configured (`BRAVE_SEARCH_API_KEY` environment variable), the bot uses Claude claude-haiku-4-5-20251001 to extract the brand name and product name from the first 600 characters of the brief. Returns empty if extraction yields "unknown" for the brand. |
 | FR-11 | **Product USP web search** | Using the extracted brand and product name, the bot queries Brave Search API with the query pattern `{brand} {product} key ingredients benefits claims`, retrieves up to 5 web results, and extracts title + description snippets. |
 | FR-12 | **Brief enrichment injection** | Web search results are appended to the brief text as a `WEB-FETCHED PRODUCT DETAILS` section with a directive to use the facts for specificity and accuracy. The enriched brief is persisted to state so it carries through to concept generation, script generation, and refinement. User is notified with a message: "🔍 Found product details online — enriching your brief with real USPs..." |
-| FR-13 | **Graceful degradation without Brave API key** | All web enrichment is skipped silently if `BRAVE_SEARCH_API_KEY` is not set or is empty. The bot functions identically to the non-enriched flow. Search failures are caught and logged without user-facing errors. |
+| FR-13 | **Graceful degradation without Brave API key** | All web enrichment is skipped silently if `BRAVE_SEARCH_API_KEY` is not set or is empty. The bot functions identically to the non-enriched flow. Search failures (timeouts, non-200 responses, parsing errors) are caught and logged without user-facing errors. |
 
 ### 3.3 Format and Sub-Format Selection
 
 | ID | Requirement | Details |
 |---|---|---|
-| FR-14 | **Three-category format menu** | After brief ingestion, the bot presents a numbered menu with three content categories: (1) IMMBT — Instagram Made Me Buy This, (2) Event coverage — launch, experience, destination, (3) Collaboration — routine, narrative, haul, gifting. User replies with `1`, `2`, or `3`. Invalid responses re-display the menu. |
-| FR-15 | **Sub-format selection per category** | Each category has a secondary menu: IMMBT has 3 sub-formats (single product discovery, viral hype check, sceptic won over); Event has 3 sub-formats (brand booth/launch, destination/travel day, community/group event); Collaboration has 5 sub-formats (routine/tutorial, personal narrative, multi-product haul, gifting/occasion, platform/retail). User selects by number. Invalid responses re-display the sub-menu. |
-| FR-16 | **Sub-format label persistence** | The selected sub-format is stored as a human-readable label (e.g., "IMMBT — single product discovery", "Brand collaboration — personal narrative, emotional hook, product as solution") and used in all subsequent prompts for concept generation, script generation, and refinement. |
+| FR-14 | **Three-category format menu** | After brief ingestion, the bot presents a numbered menu with three content categories: (1) IMMBT — Instagram Made Me Buy This, (2) Event — launch, experience, destination, (3) Collab — routine, narrative, haul, gifting. User replies with `1`, `2`, or `3`. Invalid responses re-display the menu with instruction. |
+| FR-15 | **Sub-format selection per category** | Each category has a secondary menu: **IMMBT** has 3 sub-formats (single product discovery, viral hype check, sceptic won over); **Event** has 3 sub-formats (brand booth/launch, destination/travel day, community/group event); **Collaboration** has 5 sub-formats (routine/tutorial, personal narrative, multi-product haul, gifting/occasion, platform/retail). User selects by number. Invalid responses re-display the sub-menu with valid range. |
+| FR-16 | **Sub-format label persistence** | The selected sub-format is stored as a human-readable label (e.g., "IMMBT — single product discovery", "Brand collaboration — personal narrative, emotional hook, product as solution") and used in all subsequent prompts for concept generation, script generation, and refinement. The label is also used for library categorisation when scripts are saved. |
 
 ### 3.4 Concept Generation
 
 | ID | Requirement | Details |
 |---|---|---|
-| FR-17 | **Generate 4 distinct creative concepts** | After sub-format selection, the bot generates 4 creative concept options via Claude claude-opus-4-6, each with a different angle, hook, or emotional approach. Concepts are generated using the system prompt, the brief text (including any web enrichment), the selected format label, and any approved library examples (see FR-28). |
-| FR-18 | **Concept parsing and presentation** | Concepts are parsed from the model output using regex (`CONCEPT \d+:` pattern) and presented as a numbered list. Each concept includes a short title and a 2-sentence description of the hook and angle. |
-| FR-19 | **Concept selection** | User replies with a number (`1` through `4`, or however many were successfully parsed) to select a single concept, or replies `all` to have all concepts written out as full script variations. Invalid responses re-display the options. |
-| FR-20 | **Progress indicator for concept generation** | A "Thinking up concepts… almost there ✍️" message is sent after 15 seconds if generation has not completed. |
-| FR-21 | **Concept generation failure handling** | If concepts cannot be parsed from the model output, state resets to idle and the user is asked to send their brief again. |
-
-### 3.5 Script and Caption Generation
-
-| ID
+| FR-17 | **Generate 4 distinct creative concepts** | After sub-format selection, the bot generates 4 creative concept options via Claude claude-opus-4-6, each with a different angle, hook, or emotional approach. Concepts are generated using the full system prompt (Honey's voice, script cues, emotional arc, format guides), the brief text (including any web enrichment), the selected format label, and any approved library examples (see FR-28). |
+| FR-18 | **Concept parsing and presentation** | Concepts are parsed from the model output using regex (`CONCEPT \d+:` pattern) and presented as a numbered list. Each concept includes a short punchy title and a 2-sentence description of the hook and angle. |
+| FR-19 | **Concept selection — single** | User replies with a number (`1` through however many were parsed, typically `4`) to select a single concept for full script development. |
+| FR-20 | **Concept selection — all variations** | User replies `all` to have every concept written out as full script+caption variations in a single generation pass. The count of variations matches the number of parsed concepts. |
+| FR-21 | **Progress indicator for concept
