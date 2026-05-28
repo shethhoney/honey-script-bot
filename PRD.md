@@ -1,9 +1,9 @@
 # Product Requirements Document
 ## Honey Script Bot — WhatsApp Reel Script Generator
 
-**Version:** 2.0  
-**Date:** 2025-07-14  
-**Owner:** Honey Sheth  
+**Version:** 2.0
+**Date:** 2025-07-14
+**Owner:** Honey Sheth
 **Status:** Live (Production — Railway deployment with persistent volume storage)
 
 ---
@@ -19,8 +19,9 @@ The system accepts brand briefs in any format they naturally arrive — plain te
 3. **Format and sub-format selection** — guided menu-driven selection across 3 content categories and 11 sub-formats
 4. **Concept generation** — 4 distinct creative concepts with different hooks and angles for the user to evaluate before committing to a full script
 5. **Script and caption generation** — full production-ready reel scripts with Visual/PTC/VO/Super cues and matched captions, following Honey's documented emotional arc and voice
-6. **Iterative refinement** — unlimited text or voice-based feedback loops to converge on the final output
-7. **Self-learning system** — approved scripts are saved to a persistent library and injected as few-shot examples into future generations; refinement feedback is logged and used to avoid repeating past mistakes
+6. **Voice check pass** — automated second-pass quality gate using Claude Haiku to catch generic language, overclaims, pushy CTAs, and caption drift before delivery
+7. **Iterative refinement** — unlimited text or voice-based feedback loops to converge on the final output
+8. **Self-learning system** — approved scripts are saved to a persistent library and injected as few-shot examples into future generations; refinement feedback is logged and used to avoid repeating past mistakes
 
 ### Architecture Summary
 
@@ -29,11 +30,12 @@ The system accepts brand briefs in any format they naturally arrive — plain te
 | **Primary user** | Honey Sheth (single-user personal tool) |
 | **Interface** | WhatsApp via Twilio WhatsApp Business API |
 | **AI backbone — generation** | Anthropic Claude claude-opus-4-6 (scripts, captions, concepts, email extraction, brand identification) |
+| **AI backbone — voice check** | Anthropic Claude claude-haiku-4-5-20251001 (post-generation quality pass for voice compliance) |
 | **AI backbone — brand extraction** | Anthropic Claude claude-haiku-4-5-20251001 (lightweight brand/product name extraction for web search) |
 | **AI backbone — transcription** | Groq Whisper Large v3 (voice note → text) |
 | **Web enrichment** | Brave Search API (optional — product USP lookup, up to 5 results) |
 | **Hosting** | Railway with persistent volume mounted at `/data` (fallback: `/tmp`) |
-| **Persistent storage — state** | Python `shelve` for conversation state (`honey_state`) with thread-safe locking |
+| **Persistent storage — state** | Python `shelve` for conversation state (`honey_state`) with thread-safe locking via `threading.Lock` |
 | **Persistent storage — library** | GitHub repository (`honey_library.json`) as primary, local JSON file as backup, in-memory cache with 300-second TTL |
 | **Persistent storage — feedback** | Local JSON file (`honey_feedback.json`) |
 | **Message delivery** | Twilio REST Client for outbound messages; chunked delivery for messages exceeding 1,500 characters with 0.5-second inter-chunk delay |
@@ -45,12 +47,29 @@ The system accepts brand briefs in any format they naturally arrive — plain te
 |---|---|
 | Maximum library size | 200 approved scripts (rolling window — oldest trimmed) |
 | Maximum feedback log size | 30 entries (rolling window — oldest trimmed) |
-| Examples injected per generation | 5 approved scripts |
+| Examples injected per generation | 5 approved scripts (format-prioritised) |
 | Examples injected per refinement | 2 approved scripts |
 | Library cache TTL | 300 seconds |
 | Message chunk size | 1,500 characters |
 | Maximum brief length | 8,000 characters |
 | Minimum brief length | 10 characters |
+| Progress notification delay — concepts | 15 seconds |
+| Progress notification delay — scripts/refines | 20 seconds |
+
+### Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Claude API access for generation, voice check, email extraction, brand extraction |
+| `TWILIO_ACCOUNT_SID` | Yes | Twilio account authentication and media download |
+| `TWILIO_AUTH_TOKEN` | Yes | Twilio account authentication and media download |
+| `TWILIO_WHATSAPP_NUMBER` | Yes | Outbound WhatsApp sender number |
+| `GROQ_API_KEY` | Yes | Groq Whisper API access for voice transcription |
+| `BRAVE_SEARCH_API_KEY` | No | Brave Search API for web enrichment; all enrichment skipped if absent |
+| `GITHUB_LIBRARY_TOKEN` | No | GitHub Personal Access Token for library persistence; falls back to local-only storage if absent |
+| `GITHUB_REPO` | No | GitHub repository path (default: `shethhoney/honey-script-bot`) |
+| `HONEY_NUMBER` | No | Honey's WhatsApp number for gating the `save` command; if unset, anyone can save |
+| `PORT` | No | HTTP server port (default: `5000`) |
 
 ---
 
@@ -66,11 +85,12 @@ As a content creator managing multiple brand collaborations per month, Honey fac
 
 ### What Version 2.0 Specifically Addresses
 
-Version 1.0 solved the generation and refinement loop. Version 2.0 adds three critical layers:
+Version 1.0 solved the generation and refinement loop. Version 2.0 adds four critical layers:
 
 1. **Learning from approvals** — Approved scripts are stored in a persistent library (rolling window of 200) and injected as few-shot examples (up to 5 per generation, 2 per refinement) into every future prompt, so the bot's voice converges on what Honey actually signs off on — not just what the system prompt describes. Library is backed by GitHub for durability across deploys, with in-memory caching and local file backup.
 2. **Learning from corrections** — Refinement feedback is logged persistently (rolling window of 30 entries) and injected into refinement prompts, so the bot learns from recurring correction patterns and stops making the same mistakes.
 3. **Web enrichment** — When a Brave Search API key is configured, the bot automatically extracts the brand and product name from the brief, searches for real product USPs, ingredients, and claims online, and enriches the brief before generation — producing scripts with specific, accurate product details instead of vague placeholders.
+4. **Automated voice check** — Every generated script passes through a second-pass quality gate (Claude Haiku) that catches generic openers, banned words, caption drift, feature dumps, and pushy CTAs — enforcing voice compliance before the user ever sees the output.
 
 **The goal:** eliminate manual scripting time, enable brief-to-filming in minutes, and build a system that gets measurably better at matching Honey's voice with every interaction.
 
@@ -82,7 +102,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 
 | ID | Requirement | Details |
 |---|---|---|
-| FR-01 | **Accept plain text briefs** | Any WhatsApp text message is treated as a new brief when no active flow exists and no prior script is loaded. Messages under 500 characters when a prior script exists are treated as refinement feedback instead (see FR-37). Briefs exceeding 8,000 characters are rejected with a prompt to trim. |
+| FR-01 | **Accept plain text briefs** | Any WhatsApp text message is treated as a new brief when no active flow exists and no prior script is loaded. Messages under 500 characters when a prior script exists are treated as refinement feedback instead (see FR-37). Briefs exceeding 8,000 characters are rejected with a prompt to trim. Messages with explicit brief signals (`brand brief`, `new brief`, `collab brief`, `new campaign`, `new collab`) are always treated as new briefs regardless of length or prior script state. |
 | FR-02 | **Accept and extract text from PDF attachments** | Uses PyPDF2 to read all pages and concatenate extracted text. Handles extraction failures gracefully with a fallback message asking the user to paste as plain text. |
 | FR-03 | **Accept and extract text from Word (.docx) attachments** | Uses mammoth library for raw text extraction from .docx files. Content type detection covers `word`, `docx`, and `officedocument` MIME type variants. |
 | FR-04 | **Accept image/screenshot attachments** | Image is base64-encoded and passed to Claude claude-opus-4-6 via multimodal vision input during the generation step. The image is stored in the brief field as a `[IMAGE:base64:content_type]` token and processed inline — text extraction and script generation happen in a single API call. If the image token cannot be parsed at generation time, the user is asked to resend in another format. |
@@ -98,14 +118,4 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 | ID | Requirement | Details |
 |---|---|---|
 | FR-11 | **Automatic brand and product extraction** | When a Brave Search API key is configured (`BRAVE_SEARCH_API_KEY` environment variable), the bot uses Claude claude-haiku-4-5-20251001 to extract the brand name and product name from the first 600 characters of the brief. Returns empty if extraction yields "unknown" for the brand. |
-| FR-12 | **Product USP web search** | Using the extracted brand and product name, the bot queries Brave Search API with the query pattern `{brand} {product} key ingredients benefits claims`, retrieves up to 5 web results, and extracts title + description snippets. |
-| FR-13 | **Brief enrichment injection** | Web search results are appended to the brief text as a `WEB-FETCHED PRODUCT DETAILS` section with a directive to use the facts for specificity and accuracy. The enriched brief is persisted to state so it carries through to concept generation, script generation, and refinement. User is notified with a message: "🔍 Found product details online — enriching your brief with real USPs..." |
-| FR-14 | **Graceful degradation without Brave API key** | All web enrichment is skipped silently if `BRAVE_SEARCH_API_KEY` is not set or is empty. The bot functions identically to the non-enriched flow. Search failures (timeouts, non-200 responses, parsing errors) are caught and logged without user-facing errors. |
-| FR-15 | **Enrichment timing** | Web enrichment runs at the start of the concept generation step (after format/sub-format selection), not at brief ingestion. This ensures the enrichment only occurs once per generation cycle. |
-
-### 3.3 Format and Sub-Format Selection
-
-| ID | Requirement | Details |
-|---|---|---|
-| FR-16 | **Three-category format menu** | After brief ingestion, the bot presents a numbered menu with three content categories: (1) IMMBT — Instagram Made Me Buy This, (2) Event — launch, experience, destination, (3) Collab — routine, narrative, haul, gifting. User replies with `1`, `2`, or `3`. Invalid responses re-display the menu with instruction. |
-| FR-17 | **Sub-format selection per category** | Each category has a secondary menu: **IMMBT** has 3 sub-formats (single product discovery, viral hype check, sceptic won over); **Event** has 3 sub-formats (brand booth/launch, destination/travel day, community/group event); **Collaboration** has 5 sub-formats (routine/tutorial, personal narrative, multi-product haul, gifting/occasion, platform/retail). User selects by number. Invalid responses re-display the sub-menu with valid range
+| FR-12 | **Product USP web search** | Using the extracted brand and product name, the bot queries Brave Search API with the query pattern `{brand} {product} key ingredients benefits claims`, retrieves up
