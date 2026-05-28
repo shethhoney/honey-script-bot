@@ -239,30 +239,27 @@ OUTPUT FORMAT — STRICT:
 No preamble. No notes. Just the two sections."""
 
 FORMAT_MENU = (
-    "What format is this for?\n\n"
-    "1️⃣ IMMBT\n"
-    "_(Instagram Made Me Buy This)_\n\n"
-    "2️⃣ Event coverage\n"
-    "_(launch, experience, destination)_\n\n"
-    "3️⃣ Collaboration\n"
-    "_(routine, narrative, haul, gifting)_"
+    "Which format?\n\n"
+    "1️⃣ IMMBT _(Instagram Made Me Buy This)_\n\n"
+    "2️⃣ Event _(launch, experience, destination)_\n\n"
+    "3️⃣ Collab _(routine, narrative, haul, gifting)_"
 )
 
 SUBFORMAT_MENUS = {
     "immbt": (
-        "Which type of IMMBT?\n\n"
+        "What angle?\n\n"
         "1️⃣ Single product discovery\n"
         "2️⃣ Viral / hype check\n"
         "3️⃣ Sceptic won over"
     ),
     "event": (
-        "What kind of event?\n\n"
+        "What kind?\n\n"
         "1️⃣ Brand booth or launch\n"
         "2️⃣ Destination / travel day\n"
         "3️⃣ Community or group event"
     ),
     "collab": (
-        "What kind of collab?\n\n"
+        "What kind?\n\n"
         "1️⃣ Routine or tutorial\n"
         "2️⃣ Personal narrative\n"
         "3️⃣ Multi-product or haul\n"
@@ -665,9 +662,9 @@ def send_script_and_caption(to, script, caption, multiple_raw=None):
             time.sleep(0.5)
     send_message(to,
         "─────────────────\n"
-        "Reply with feedback to refine — text or voice note\n"
-        "Type *save* when you're happy with a version to teach me your voice\n"
-        "Or send a new brief to start fresh."
+        "Tell me what to change — text or voice note 🎤\n"
+        "Type *again* for a totally different angle\n"
+        "Type *save* when you're happy — teaches me your voice 🧠"
     )
 
 def process_concepts_and_send(from_number, brief_text, format_label):
@@ -879,10 +876,26 @@ def webhook():
             return Response(str(resp), mimetype="text/xml")
         count = add_to_library(last_script, last_caption, format_label, brief)
         resp.message(
-            f"✅ Saved to your library! ({count} approved script{'s' if count != 1 else ''} total)\n\n"
-            f"Every future script will learn from your approved examples. "
-            f"The more you save, the closer it gets to your exact voice."
+            f"✅ Saved! ({count} approved script{'s' if count != 1 else ''} in your library)\n\n"
+            f"Every script from now uses this as a reference. The more you save, the more it sounds like you."
         )
+        return Response(str(resp), mimetype="text/xml")
+
+    # ── Again command — regenerate with a different angle ─────────────────────
+    if lower == "again":
+        brief_text   = state.get("brief", "")
+        format_label = state.get("subformat_label", "")
+        if not brief_text or not format_label:
+            resp.message("No brief in memory yet — send me one first!")
+            return Response(str(resp), mimetype="text/xml")
+        set_state(from_number, {**state, "step": "generating"})
+        resp.message("Different angle, coming up… 30 secs ✍️")
+        threading.Thread(
+            target=process_and_send,
+            args=(from_number, brief_text, format_label, None,
+                  "Try a completely different hook, opening moment, and emotional angle from any previous version."),
+            daemon=True
+        ).start()
         return Response(str(resp), mimetype="text/xml")
 
     # ── Library command ───────────────────────────────────────────────────────
@@ -912,16 +925,9 @@ def webhook():
         library_count = len(load_library())
         library_line  = f"\n\n📚 Your library has {library_count} approved script{'s' if library_count != 1 else ''} — I'm learning from {'them' if library_count != 1 else 'it'}." if library_count > 0 else ""
         resp.message(
-            "👋 Hey! I'm Honey's script generator.\n\n"
-            "Send me a brand brief and I'll write the reel script + caption in your voice.\n\n"
-            "*I can read:*\n"
-            "📄 PDF files\n"
-            "📝 Word docs\n"
-            "🖼️ Images / screenshots\n"
-            "📧 Forwarded brand emails\n"
-            "🎤 Voice notes\n"
-            "✍️ Plain text\n\n"
-            "*Commands:* save · library · help · cancel"
+            "Hey Honey! 👋 Ready when you are.\n\n"
+            "Drop a brief — text, PDF, Word doc, screenshot, forwarded email, or voice note — and I'll write the script + caption in your voice.\n\n"
+            "*Commands:* save · again · library · help · cancel"
             + library_line
         )
         return Response(str(resp), mimetype="text/xml")
@@ -929,14 +935,15 @@ def webhook():
     if lower == "help":
         resp.message(
             "*How it works:*\n"
-            "1. Send brief / email / voice note\n"
-            "2. Choose format (1/2/3)\n"
-            "3. Choose sub-format\n"
-            "4. Pick a concept (1/2/3/4)\n"
-            "5. Get reel script + caption\n"
-            "6. Refine with feedback (text or voice)\n"
-            "7. Type *save* when happy — teaches me your voice\n\n"
-            "*Commands:* save · library · help · cancel"
+            "1. Send brief (text, PDF, doc, image, voice note, email)\n"
+            "2. Pick format → sub-format\n"
+            "3. Get script + caption\n"
+            "4. Give feedback to refine (text or voice 🎤)\n\n"
+            "*Commands:*\n"
+            "• *again* — totally different angle, same brief\n"
+            "• *save* — approve this version, teaches me your voice\n"
+            "• *library* — see saved scripts\n"
+            "• *cancel* — start over"
         )
         return Response(str(resp), mimetype="text/xml")
 
@@ -961,15 +968,15 @@ def webhook():
         max_opts = VALID_SUBFORMAT_COUNTS.get(chosen_format, 3)
         valid = [str(i) for i in range(1, max_opts + 1)]
         if lower not in valid:
-            resp.message(f"Please reply with a number between 1 and {max_opts}.\n\n" + SUBFORMAT_MENUS[chosen_format])
+            resp.message(f"Pick a number between 1 and {max_opts} 👇\n\n" + SUBFORMAT_MENUS[chosen_format])
             return Response(str(resp), mimetype="text/xml")
         subformat_label = SUBFORMAT_LABELS[chosen_format][lower]
         brief_text = state.get("brief", "")
         lib_count  = len(load_library())
-        learning_note = f" I'm drawing on {lib_count} of your approved scripts." if lib_count > 0 else ""
-        set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating_concepts"})
-        resp.message(f"Got it — *{subformat_label}*\n\n💡 Generating concept ideas… give me 15 seconds.{learning_note}")
-        threading.Thread(target=process_concepts_and_send, args=(from_number, brief_text, subformat_label), daemon=True).start()
+        learning_note = f" Using your {lib_count} saved scripts as reference." if lib_count > 0 else ""
+        set_state(from_number, {**state, "subformat_label": subformat_label, "step": "generating"})
+        resp.message(f"Perfect — *{subformat_label}*. Writing now… 30 secs ✍️{learning_note}")
+        threading.Thread(target=process_and_send, args=(from_number, brief_text, subformat_label), daemon=True).start()
         return Response(str(resp), mimetype="text/xml")
 
     # ── Awaiting concept ──────────────────────────────────────────────────────
@@ -1009,7 +1016,7 @@ def webhook():
 
     # ── Idle with previous script — short message goes straight to refine ─────
     if step == "idle" and state.get("last_script") and not media_url:
-        if not is_greeting(msg_body) and lower not in ["help", "cancel", "save", "library", "my scripts", "examples"]:
+        if not is_greeting(msg_body) and lower not in ["help", "cancel", "save", "again", "library", "my scripts", "examples"]:
             # Only treat as a new brief if it explicitly says so or is very long
             brief_signals = ["brand brief", "new brief", "collab brief", "new campaign", "new collab"]
             looks_like_brief = len(msg_body) > 500 or any(s in lower for s in brief_signals)
