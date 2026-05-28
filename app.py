@@ -749,7 +749,51 @@ Write the script and caption for this brief. Voice must match the approved examp
     cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
     script = sm.group(1).strip() if sm else raw.strip()
     caption = cm.group(1).strip() if cm else ""
+    # Voice-check pass before returning
+    script, caption = voice_check(script, caption, format_label)
     return script, caption, None
+
+
+def voice_check(script, caption, format_label):
+    """Second-pass check: catch generic language, overclaims, and caption drift.
+    Uses haiku — fast and cheap. Returns corrected script + caption."""
+    if not script:
+        return script, caption
+    prompt = f"""You wrote this Instagram reel script and caption for Honey Sheth. Read it back and fix ONLY the issues below. Do not rewrite anything that doesn't have a problem.
+
+ISSUES TO CHECK AND FIX:
+1. PTC line opens with "I tried X", "I've been using X", "I picked up X" or any generic product intro → rewrite to open with a personal observation, confession, or feeling BEFORE the product arrives
+2. Any of these words appear: "obsessed", "absolutely love", "game changer", "holy grail", "amazing", "incredible", "blown away" → replace with honest, qualified language ("I've noticed", "something about it works", "it's the kind of thing that")
+3. Caption is a summary of the video → rewrite caption as a different angle — more internal, quieter, essay-like. Starts with a thought or confession, not a product claim.
+4. More than 2 product claims in a single VO line → cut to the one that matters most
+5. CTA is pushy ("go buy", "link in bio", "shop now") → soften to a natural conversation-ender
+
+FORMAT: {format_label}
+
+[REEL SCRIPT]
+{script}
+
+[CAPTION]
+{caption}
+
+Return the corrected version in the same [REEL SCRIPT] / [CAPTION] format. If nothing needs fixing, return it exactly as-is. No explanations."""
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text
+        sm = re.search(r'\[REEL SCRIPT\]([\s\S]*?)(?=\[CAPTION\])', raw, re.IGNORECASE)
+        cm = re.search(r'\[CAPTION\]([\s\S]*?)$', raw, re.IGNORECASE)
+        checked_script  = sm.group(1).strip() if sm else script
+        checked_caption = cm.group(1).strip() if cm else caption
+        return checked_script, checked_caption
+    except Exception as e:
+        print(f"Voice check error (using original): {e}")
+        return script, caption  # fall back to original if check fails
 
 
 def refine_script(brief_text, format_label, last_script, last_caption, instruction):
@@ -1001,8 +1045,15 @@ def webhook():
         threading.Thread(target=handle_voice, daemon=True).start()
         return Response(str(resp), mimetype="text/xml")
 
-    # ── Save command ──────────────────────────────────────────────────────────
+    # ── Save command (only Honey's number can approve to library) ────────────
     if lower == "save":
+        honey_number = os.environ.get("HONEY_NUMBER", "").strip()
+        if honey_number and from_number != honey_number:
+            resp.message(
+                "Scripts can only be approved from Honey's phone.\n\n"
+                "Share this script with her — she can type *save* to add it to the training library."
+            )
+            return Response(str(resp), mimetype="text/xml")
         last_script  = state.get("last_script", "")
         last_caption = state.get("last_caption", "")
         format_label = state.get("subformat_label", "")
@@ -1012,7 +1063,7 @@ def webhook():
             return Response(str(resp), mimetype="text/xml")
         count = add_to_library(last_script, last_caption, format_label, brief)
         resp.message(
-            f"✅ Saved! ({count} approved script{'s' if count != 1 else ''} in your library)\n\n"
+            f"✅ Saved! ({count} scripts in your library)\n\n"
             f"Every script from now uses this as a reference. The more you save, the more it sounds like you."
         )
         return Response(str(resp), mimetype="text/xml")
