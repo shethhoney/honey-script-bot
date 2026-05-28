@@ -21,7 +21,7 @@ The system accepts brand briefs in any format they naturally arrive — plain te
 5. **Iterative refinement** — unlimited text or voice-based feedback loops to converge on the final output
 6. **Self-learning system** — approved scripts are saved to a persistent library and injected as few-shot examples into future generations; refinement feedback is logged and used to avoid repeating past mistakes
 
-The bot is built on a Flask application deployed to Railway with persistent volume storage, using Anthropic Claude claude-opus-4-6 as the primary generation model, Groq Whisper Large v3 for voice transcription, Brave Search API for optional product enrichment, and Twilio WhatsApp Business API as the messaging interface.
+The bot is built on a Flask application deployed to Railway with persistent volume storage, using Anthropic Claude claude-opus-4-6 as the primary generation model, Groq Whisper Large v3 for voice transcription, Brave Search API for optional product enrichment, and Twilio WhatsApp Business API as the messaging interface. Script library persistence is dual-layered: GitHub-backed remote storage with a local JSON file as backup.
 
 | Attribute | Detail |
 |---|---|
@@ -32,8 +32,11 @@ The bot is built on a Flask application deployed to Railway with persistent volu
 | **AI backbone — transcription** | Groq Whisper Large v3 (voice note → text) |
 | **Web enrichment** | Brave Search API (optional — product USP lookup, up to 5 results) |
 | **Hosting** | Railway with persistent volume mounted at `/data` (fallback: `/tmp`) |
-| **Persistent storage** | Python `shelve` for conversation state; JSON files for script library (`honey_library.json`) and feedback log (`honey_feedback.json`) |
-| **Message delivery** | Twilio REST Client for outbound messages; chunked delivery for messages exceeding 1,500 characters |
+| **Persistent storage — state** | Python `shelve` for conversation state (`honey_state`) |
+| **Persistent storage — library** | GitHub repository (`honey_library.json`) as primary, local JSON file as backup, in-memory cache with 300-second TTL |
+| **Persistent storage — feedback** | Local JSON file (`honey_feedback.json`) |
+| **Message delivery** | Twilio REST Client for outbound messages; chunked delivery for messages exceeding 1,500 characters with 0.5-second inter-chunk delay |
+| **Library limits** | 200 approved scripts (rolling window); 30 feedback entries (rolling window); 3 examples injected per generation |
 
 ---
 
@@ -51,7 +54,7 @@ As a content creator managing multiple brand collaborations per month, Honey fac
 
 Version 1.0 solved the generation and refinement loop. Version 2.0 adds three critical layers:
 
-1. **Learning from approvals** — Approved scripts are stored in a persistent library (rolling window of 20) and injected as few-shot examples into every future generation, so the bot's voice converges on what Honey actually signs off on — not just what the system prompt describes.
+1. **Learning from approvals** — Approved scripts are stored in a persistent library (rolling window of 200) and injected as few-shot examples (3 per generation) into every future generation, so the bot's voice converges on what Honey actually signs off on — not just what the system prompt describes. Library is backed by GitHub for durability across deploys.
 2. **Learning from corrections** — Refinement feedback is logged persistently (rolling window of 30 entries) and injected into refinement prompts, so the bot learns from recurring correction patterns and stops making the same mistakes.
 3. **Web enrichment** — When a Brave Search API key is configured, the bot automatically extracts the brand and product name from the brief, searches for real product USPs, ingredients, and claims online, and enriches the brief before generation — producing scripts with specific, accurate product details instead of vague placeholders.
 
@@ -69,7 +72,7 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 | FR-02 | **Accept and extract text from PDF attachments** | Uses PyPDF2 to read all pages and concatenate extracted text. Handles extraction failures gracefully with a fallback message asking the user to paste as plain text. |
 | FR-03 | **Accept and extract text from Word (.docx) attachments** | Uses mammoth library for raw text extraction from .docx files. Content type detection covers `word`, `docx`, and `officedocument` MIME type variants. |
 | FR-04 | **Accept image/screenshot attachments** | Image is base64-encoded and passed to Claude claude-opus-4-6 via multimodal vision input during the generation step. The image is stored in the brief field as a `[IMAGE:base64:content_type]` token and processed inline — text extraction and script generation happen in a single API call. If the image token cannot be parsed at generation time, the user is asked to resend in another format. |
-| FR-05 | **Accept voice note briefs** | Audio is downloaded from Twilio media URL, saved to a temporary file with the appropriate extension (`.ogg`, `.m4a`, `.mp3`, `.webm`), transcribed via Groq Whisper Large v3, and then treated as a text brief. Transcription is echoed back to the user in italics for confirmation before proceeding to format selection. Supported audio MIME type keywords: `audio`, `ogg`, `mpeg`, `mp4`, `webm`. |
+| FR-05 | **Accept voice note briefs** | Audio is downloaded from Twilio media URL, saved to a temporary file with the appropriate extension (`.ogg`, `.m4a`, `.mp3`, `.webm`), transcribed via Groq Whisper Large v3, and then treated as a text brief. Transcription is echoed back to the user in italics for confirmation before proceeding to format selection. Supported audio MIME type keywords: `audio`, `ogg`, `mpeg`, `mp4`, `webm`. Temporary audio files are cleaned up after transcription. |
 | FR-06 | **Detect forwarded brand emails** | Heuristic detection based on signal keyword count: if ≥2 of the following appear in the message text — `from:`, `subject:`, `dear honey`, `hi honey`, `hello honey`, `we would like`, `we are reaching out`, `collaboration`, `partnership`, `deliverables`, `compensation`, `deadline`, `fwd:`, `forwarded message`, `------` — the message is classified as a forwarded email. Only triggered for text messages (not media attachments). |
 | FR-07 | **Extract structured brief from detected emails** | When an email is detected (FR-06), Claude claude-opus-4-6 extracts a structured brief in the format: Brand, Product, Key Claims, Deliverables, Deadline, Extra Notes. The extracted brief is sent back to the user for transparency, then used as the brief text for the remainder of the flow. Falls back to the raw email text if extraction fails. |
 | FR-08 | **Reject empty or insufficient briefs** | If extracted text is empty or under 10 characters, the user is prompted to resend in a different format or paste as plain text. |
@@ -97,7 +100,4 @@ Version 1.0 solved the generation and refinement loop. Version 2.0 adds three cr
 | ID | Requirement | Details |
 |---|---|---|
 | FR-17 | **Generate 4 distinct creative concepts** | After sub-format selection, the bot generates 4 creative concept options via Claude claude-opus-4-6, each with a different angle, hook, or emotional approach. Concepts are generated using the full system prompt (Honey's voice, script cues, emotional arc, format guides), the brief text (including any web enrichment), the selected format label, and any approved library examples (see FR-28). |
-| FR-18 | **Concept parsing and presentation** | Concepts are parsed from the model output using regex (`CONCEPT \d+:` pattern) and presented as a numbered list. Each concept includes a short punchy title and a 2-sentence description of the hook and angle. |
-| FR-19 | **Concept selection — single** | User replies with a number (`1` through however many were parsed, typically `4`) to select a single concept for full script development. |
-| FR-20 | **Concept selection — all variations** | User replies `all` to have every concept written out as full script+caption variations in a single generation pass. The count of variations matches the number of parsed concepts. |
-| FR-21 | **Progress indicator for concept
+| FR-18 | **Concept parsing and presentation** | Concepts are parsed from the model output using regex (`CONCEPT \d

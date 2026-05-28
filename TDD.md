@@ -2,7 +2,7 @@
 
 **Version:** 2.0
 **Date:** 2025-07-09
-**Author:** Technical Documentation
+**Author:** Auto-generated from codebase analysis
 **Status:** Production
 
 ---
@@ -31,47 +31,86 @@
 
 ## 1. System Overview
 
-The Honey Script Bot is a single-user, WhatsApp-based AI assistant purpose-built for Indian lifestyle/beauty/travel content creator **Honey Sheth**. It generates Instagram Reel scripts and captions that match her established voice and editorial style, trained on 37 of her real scripts embedded as a system prompt.
+The Honey Script Bot is a personal, AI-powered WhatsApp assistant built for Indian lifestyle, beauty, and travel content creator **Honey Sheth**. It automates the generation of Instagram Reel scripts and accompanying captions, fine-tuned to match Honey's distinctive voice and content style.
 
 ### Core Workflow
 
-1. Honey sends a **brand brief** via WhatsApp (text, PDF, Word doc, screenshot, forwarded email, or voice note).
-2. The bot extracts and optionally enriches the brief with web-searched product USPs.
-3. Honey selects a **content format** (IMMBT / Event / Collab) and **sub-format** (11 total options).
-4. The bot generates **4 creative concepts** for the reel.
-5. Honey picks a concept (or requests all variations).
-6. The bot generates a full **reel script** (with Visual/PTC/VO/Super cues) and an **Instagram caption**.
-7. Honey iterates via **text or voice feedback** until satisfied.
-8. Honey can **save** approved scripts to a personal library, which feeds back into future generations as few-shot examples.
+```
+Brand Brief (text/PDF/DOCX/image/voice/email)
+        │
+        ▼
+  Format Selection (IMMBT / Event / Collab)
+        │
+        ▼
+  Sub-format Selection (3–5 options per format)
+        │
+        ▼
+  Concept Generation (4 creative angles)
+        │
+        ▼
+  Script + Caption Generation (Claude Opus)
+        │
+        ▼
+  Iterative Refinement Loop (text or voice feedback)
+        │
+        ▼
+  Save to Library (approved scripts train future output)
+```
 
 ### Design Philosophy
 
-- **Single-user system** — no authentication layer; designed exclusively for one WhatsApp number.
-- **Conversational state machine** — the entire UX is a guided multi-step flow within WhatsApp.
-- **Self-improving** — approved scripts and feedback logs accumulate over time, steering the AI toward Honey's preferences with each interaction.
-- **Asynchronous processing** — long-running AI calls happen in background threads so Twilio receives immediate `200 OK` responses.
+- **Single-user tool**: Designed exclusively for one creator. No multi-tenancy, no auth layer beyond WhatsApp identity.
+- **Learning system**: Every approved script is saved to a persistent library and injected as few-shot examples into future generations, causing the AI's output to converge toward Honey's actual voice over time.
+- **Conversational UX**: The entire interface is a WhatsApp chat — no web dashboard, no login screen. Briefs can arrive as text, documents, images, forwarded emails, or voice notes.
+- **Asynchronous processing**: All AI generation happens in background daemon threads to prevent Twilio webhook timeouts, with progress messages sent while the user waits.
 
 ---
 
 ## 2. Tech Stack
 
-| Component | Technology | Version | Reasoning |
-|---|---|---|---|
-| **Runtime** | Python 3 | 3.x (Railway Nixpacks) | Broad library support for AI/ML, rapid prototyping |
-| **Web Framework** | Flask | 2.3.3 | Lightweight; sufficient for a single webhook endpoint |
-| **WSGI Server** | Gunicorn | 21.2.0 | Production-grade HTTP server; single-worker config for state safety |
-| **ASGI Compat** | Werkzeug | 2.3.7 | Pinned to match Flask 2.3.x compatibility |
-| **LLM Provider** | Anthropic (Claude) | SDK 0.89.0 | Claude claude-opus-4-6 for high-quality creative writing; Claude claude-haiku-4-5-20251001 for lightweight extraction |
-| **Speech-to-Text** | Groq (Whisper) | REST API | Free tier; `whisper-large-v3` for accurate English + Hindi code-switching transcription |
-| **Messaging** | Twilio WhatsApp API | SDK 8.2.0 | Industry standard for WhatsApp Business API integration; handles media relay |
-| **Web Search** | Brave Search API | REST API | Optional enrichment; privacy-focused search with structured JSON results |
-| **PDF Extraction** | PyPDF2 | 3.0.1 | Pure Python; no native dependencies for Railway deployment |
-| **DOCX Extraction** | Mammoth | 1.6.0 | Extracts raw text from `.docx`; no LibreOffice dependency required |
-| **HTTP Client** | Requests | 2.31.0 | Used for Twilio media downloads, Groq API, Brave Search API |
-| **State Storage** | Python `shelve` | stdlib | Key-value persistence with no external database dependency |
-| **Data Storage** | JSON files | stdlib | Human-readable; sufficient for small rolling windows (20 scripts, 30 feedback entries) |
-| **Concurrency** | Python `threading` | stdlib | Daemon threads for background AI processing; thread locks for state safety |
-| **Hosting** | Railway | Hobby plan | Simple container deployment with persistent volume support |
+### Application Framework
+
+| Component | Library/Version | Reasoning |
+|-----------|----------------|-----------|
+| Web Framework | Flask 2.3.3 | Lightweight, minimal overhead for a single-endpoint webhook server. No ORM, no template engine — only JSON/XML responses needed. |
+| WSGI Server | Gunicorn 21.2.0 | Production-grade WSGI server; configured with a single worker to avoid concurrency issues with `shelve` file-based state. |
+| HTTP Utility | Werkzeug 2.3.7 | Pinned explicitly to maintain compatibility with Flask 2.3.3. |
+
+### AI & ML Services
+
+| Component | Service/Model | Reasoning |
+|-----------|--------------|-----------|
+| Script Generation | Anthropic Claude `claude-opus-4-6` | Opus-tier model chosen for its superior creative writing quality, ability to maintain consistent voice across long-form scripts, and strong instruction following for format-specific output. Used for script generation, refinement, concept generation, and email brief extraction. |
+| Brand/Product Extraction | Anthropic Claude `claude-haiku-4-5-20251001` | Lightweight, low-cost model used only for the narrow task of extracting brand/product names from briefs before web search enrichment. |
+| Voice Transcription | Groq `whisper-large-v3` | Free-tier Groq API provides fast Whisper transcription. Enables voice-note-based briefs and feedback — critical for a mobile-first WhatsApp workflow. |
+| Anthropic SDK | `anthropic` 0.89.0 | Official Python SDK for Claude API access. |
+
+### Messaging & Communication
+
+| Component | Library/Version | Reasoning |
+|-----------|----------------|-----------|
+| WhatsApp API | Twilio 8.2.0 | Industry-standard WhatsApp Business API provider. Handles message send/receive, media hosting, and webhook delivery. |
+
+### Document Processing
+
+| Component | Library/Version | Reasoning |
+|-----------|----------------|-----------|
+| PDF Extraction | PyPDF2 3.0.1 | Pure-Python PDF text extraction — no system dependencies required, which simplifies container deployment on Railway. |
+| DOCX Extraction | Mammoth 1.6.0 | Extracts raw text from `.docx` files. Chosen over `python-docx` for its simpler API when only text content is needed. |
+
+### Networking & Data
+
+| Component | Library/Version | Reasoning |
+|-----------|----------------|-----------|
+| HTTP Client | Requests 2.31.0 | Used for Twilio media downloads, Groq API calls, Brave Search API, and GitHub API interactions. |
+
+### Infrastructure & Storage
+
+| Component | Technology | Reasoning |
+|-----------|-----------|-----------|
+| State Store | Python `shelve` (stdlib) | Zero-dependency key-value store for conversation state. Adequate for single-user, single-worker deployment. |
+| Library Persistence | GitHub API + local JSON | GitHub serves as durable, version-controlled primary storage for the script library. Local JSON file acts as backup. |
+| Hosting | Railway (Hobby plan) | Simple container hosting with persistent volume support, health checks, and automatic restarts. |
 
 ---
 
@@ -79,196 +118,168 @@ The Honey Script Bot is a single-user, WhatsApp-based AI assistant purpose-built
 
 ```
 honey-script-bot/
-├── app.py                  # Entire application — single-file monolith
-├── requirements.txt        # Pinned Python dependencies
+├── app.py                  # Monolithic application — all logic in one file
+├── requirements.txt        # Python dependencies (8 packages)
 ├── railway.toml            # Railway deployment configuration
-└── /data/                  # Railway persistent volume (mounted at runtime)
-    ├── honey_state.db      # shelve database (conversation state per phone number)
-    ├── honey_library.json  # Approved script library (rolling window of 20)
-    └── honey_feedback.json # Refinement feedback log (rolling window of 30)
+├── honey_library.json      # Approved script library (GitHub-synced)
+└── /data/                  # Railway persistent volume (runtime)
+    ├── honey_state.db      # shelve database for conversation state
+    ├── honey_library.json  # Local backup of script library
+    └── honey_feedback.json # Rolling feedback log
 ```
 
 ### Architectural Pattern
 
-The application follows a **single-file monolith** pattern. All logic — routing, state management, AI orchestration, media processing, storage — lives in `app.py`. This is deliberate for a single-user tool: minimal operational complexity, easy to debug, and trivial to deploy.
-
-### Request Flow
+The application follows a **monolithic single-file architecture** with the following logical sections:
 
 ```
-WhatsApp → Twilio → POST /webhook → Flask route handler
-                                       │
-                                       ├─ Synchronous: TwiML 200 OK response
-                                       │
-                                       └─ Async (daemon thread):
-                                           ├─ Media download/extraction
-                                           ├─ Brief enrichment (Brave Search)
-                                           ├─ AI generation (Anthropic Claude)
-                                           ├─ State update (shelve)
-                                           └─ Response delivery (Twilio REST)
+app.py
+├── Environment validation & client initialization
+├── Persistent storage configuration
+├── GitHub-backed library cache layer
+├── State management (shelve-based)
+├── Script library CRUD operations
+├── Feedback tracking system
+├── System prompt (Honey's voice definition)
+├── Format/subformat menu definitions
+├── Messaging helpers (chunking, sending)
+├── Media processing (PDF, DOCX, image, audio)
+├── Web search enrichment (Brave Search)
+├── AI generation functions (concepts, scripts, refinement)
+├── Background worker functions
+├── Webhook route handler (conversation state machine)
+└── Health check route
 ```
 
-### Module Organization (within app.py)
+### Data Flow Diagram
 
-The file is organized into clearly demarcated sections via comment headers:
-
-| Section | Lines (approx.) | Responsibility |
-|---|---|---|
-| Environment validation | Startup | Fail-fast if required env vars are missing |
-| Persistent storage | Config | Path detection, file paths, constants |
-| State (conversation flow) | Functions | `get_state()`, `set_state()` |
-| Script library | Functions | CRUD for approved scripts, few-shot selection |
-| Feedback tracker | Functions | CRUD for refinement feedback, pattern extraction |
-| System prompt | Constant | 2000+ character prompt encoding Honey's voice |
-| Format menus | Constants | Menu text, labels, key mappings |
-| Messaging helpers | Functions | `send_message()`, `send_in_chunks()` |
-| Media helpers | Functions | Download, transcribe, extract PDF/DOCX/image |
-| Web search enrichment | Functions | Brave Search integration, brief enrichment |
-| AI generation | Functions | `generate_concepts()`, `generate_script()`, `refine_script()` |
-| Background workers | Functions | Thread targets that orchestrate generation + delivery |
-| Webhook | Route | Main `/webhook` POST handler with state machine logic |
-| Health | Route | `/health` GET endpoint |
+```
+┌─────────────┐     ┌──────────┐     ┌──────────────┐
+│  WhatsApp    │────▶│  Twilio  │────▶│  /webhook    │
+│  (Honey)     │◀────│  API     │◀────│  (Flask)     │
+└─────────────┘     └──────────┘     └──────┬───────┘
+                                            │
+                    ┌───────────────────────┬┴──────────────────────┐
+                    │                       │                       │
+              ┌─────▼──────┐      ┌────────▼────────┐    ┌───────▼────────┐
+              │  Anthropic  │      │   Groq Whisper  │    │  Brave Search  │
+              │  Claude API │      │   (voice notes) │    │  (product USPs)│
+              └─────┬──────┘      └────────┬────────┘    └───────┬────────┘
+                    │                       │                     │
+                    └───────────┬───────────┘                     │
+                                │                                 │
+                    ┌───────────▼──────────────────────────────────▼┐
+                    │              State & Storage                   │
+                    │  ┌─────────┐  ┌──────────┐  ┌─────────────┐ │
+                    │  │ shelve  │  │ library  │  │  feedback   │ │
+                    │  │ (state) │  │ (JSON)   │  │  (JSON)     │ │
+                    │  └─────────┘  └─────┬────┘  └─────────────┘ │
+                    └─────────────────────┼────────────────────────┘
+                                          │
+                                   ┌──────▼──────┐
+                                   │   GitHub    │
+                                   │  (durable   │
+                                   │   storage)  │
+                                   └─────────────┘
+```
 
 ---
 
 ## 4. Environment Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | **Yes** | API key for Anthropic Claude. Used for all LLM calls (script generation, concept generation, refinement, email extraction, brand/product extraction). |
-| `TWILIO_ACCOUNT_SID` | **Yes** | Twilio Account SID. Used for REST API client initialization and as HTTP Basic Auth username when downloading media from Twilio URLs. |
-| `TWILIO_AUTH_TOKEN` | **Yes** | Twilio Auth Token. Used for REST API client initialization and as HTTP Basic Auth password for media downloads. |
-| `TWILIO_WHATSAPP_NUMBER` | **Yes** | Twilio WhatsApp sender number in `whatsapp:+1234567890` format. Used as the `from_` parameter for all outbound messages. |
-| `GROQ_API_KEY` | **Yes** | API key for Groq's Whisper endpoint. Used for voice note transcription via `whisper-large-v3`. |
-| `BRAVE_SEARCH_API_KEY` | No | API key for Brave Search. **Optional.** When present, enables automatic brief enrichment by searching for product USPs, ingredients, and claims. All search-related code gracefully degrades to empty strings if absent. |
-| `PORT` | No | Port for the Flask/Gunicorn server. Defaults to `5000`. Railway sets this automatically. |
+All required variables are validated at startup. The application raises `RuntimeError` if any required variable is missing.
 
-### Startup Validation
+### Required Variables
 
-The five required variables are validated at import time:
+| Variable | Description | Used By |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | API key for Anthropic Claude. Authenticates all script generation, concept generation, refinement, email extraction, and brand/product extraction calls. | `anthropic.Anthropic()` client |
+| `TWILIO_ACCOUNT_SID` | Twilio Account SID. Used for REST API client authentication and HTTP Basic Auth when downloading media files from Twilio-hosted URLs. | `twilio.rest.Client()`, `requests.get()` auth |
+| `TWILIO_AUTH_TOKEN` | Twilio Auth Token. Paired with Account SID for authentication. | `twilio.rest.Client()`, `requests.get()` auth |
+| `TWILIO_WHATSAPP_NUMBER` | The Twilio WhatsApp sender number (format: `whatsapp:+1234567890`). Used as the `from_` parameter in all outbound messages. | `twilio_client.messages.create()` |
+| `GROQ_API_KEY` | API key for Groq's Whisper transcription endpoint. Sent as Bearer token in Authorization header. | Voice note transcription via `requests.post()` |
 
-```python
-_REQUIRED_ENV = ["ANTHROPIC_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
-                 "TWILIO_WHATSAPP_NUMBER", "GROQ_API_KEY"]
-for _key in _REQUIRED_ENV:
-    if not os.environ.get(_key):
-        raise RuntimeError(f"Missing required environment variable: {_key}")
-```
+### Optional Variables
 
-If any are missing, the process exits immediately with a `RuntimeError` — preventing a partially-configured deployment from accepting traffic.
+| Variable | Description | Default/Fallback |
+|----------|-------------|-----------------|
+| `GITHUB_LIBRARY_TOKEN` | Personal access token for GitHub API. Enables reading/writing `honey_library.json` to the repository. If absent, GitHub sync is silently disabled and only local file storage is used. | `""` (empty string — GitHub sync disabled) |
+| `GITHUB_REPO` | GitHub repository in `owner/repo` format for library storage. | `"shethhoney/honey-script-bot"` |
+| `BRAVE_SEARCH_API_KEY` | API key for Brave Search API. Enables automatic product USP enrichment by searching the web for brand/product details extracted from briefs. If absent, enrichment is silently skipped. | `""` (empty string — enrichment disabled) |
+| `PORT` | Port for the Flask/Gunicorn server to bind to. | `5000` |
 
 ---
 
 ## 5. State Machine
 
-The bot implements a **per-user conversational state machine** persisted in a `shelve` database. Each phone number has an independent state object.
+Conversation state is tracked per phone number using `shelve`. Each state includes the step name plus accumulated context (brief text, format selections, generated scripts, etc.).
 
-### States
-
-| State | Description | What the bot expects |
-|---|---|---|
-| `idle` | Default/reset state. No active workflow in progress. | A new brief (any media type), a greeting, a command (`save`, `again`, `library`, `help`, `cancel`), or — if `last_script` exists — a short text message treated as refinement feedback. |
-| `awaiting_format` | Brief has been received and extracted. Waiting for top-level format selection. | A reply of `1`, `2`, or `3` corresponding to IMMBT, Event, or Collab. |
-| `awaiting_subformat` | Top-level format selected. Waiting for sub-format selection. | A reply of `1`–`3` (IMMBT/Event) or `1`–`5` (Collab) selecting the specific angle. |
-| `generating` | AI generation is in progress (in a background thread). | No user input expected. Any incoming message during this state falls through to default handling. The state is transient — set before thread launch, cleared when the thread completes. |
-| `awaiting_concept` | 4 creative concepts have been presented. Waiting for concept selection. | A reply of `1`–`4` to select a concept, or `all` to generate all variations. |
-| `awaiting_refine` | *(Defined in code but not explicitly set — see note below)* | Refinement feedback as text or voice note. |
-
-> **Note on `awaiting_refine`:** The code defines handling for `step == "awaiting_refine"` in both the webhook and voice note handler, but the actual state is never explicitly set to `awaiting_refine` anywhere in the codebase. Instead, after script delivery, the state is set back to `idle` with `last_script` populated. The `idle` state handler has smart routing logic: if `last_script` exists and the incoming message is short (under 500 characters) and doesn't contain brief-like signals, it's automatically treated as refinement feedback. Voice notes also check for `last_script` to determine routing. This means the `awaiting_refine` state exists as a reachable code path (e.g., if manually set) but is effectively dead code under normal flow.
-
-### State Transition Diagram
+### State Diagram
 
 ```
-                              ┌─────────────────┐
-                              │                  │
-                    greeting  │      idle        │◄──── cancel (from any state)
-                    ─────────►│  (entry point)   │◄──── generation complete
-                              │                  │◄──── error recovery
-                              └────────┬─────────┘
-                                       │
-                          ┌────────────┼─────────────────┐
-                          │            │                  │
-                     new brief    short msg +        save/again/
-                     (any media)  last_script        library/help
-                          │        exists                 │
-                          │            │              (commands)
-                          ▼            ▼
-                 ┌─────────────┐   refine flow
-                 │  awaiting   │   (direct to
-                 │   format    │    generating)
-                 │  (1/2/3)    │
-                 └──────┬──────┘
-                        │
-                    1, 2, or 3
-                        │
-                        ▼
-                 ┌─────────────┐
-                 │  awaiting   │
-                 │  subformat  │
-                 │ (1-3 or 1-5)│
-                 └──────┬──────┘
-                        │
-                   valid choice
-                        │
-                        ▼
-                 ┌─────────────┐
-                 │ generating  │ ── concept generation (background thread)
-                 │  (concepts) │
-                 └──────┬──────┘
-                        │
-                  concepts ready
-                        │
-                        ▼
-                 ┌─────────────┐
-                 │  awaiting   │
-                 │   concept   │
-                 │(1-4 or "all")│
-                 └──────┬──────┘
-                        │
-                 ┌──────┴──────┐
-                 │             │
-            single (1-4)    "all"
-                 │             │
-                 ▼             ▼
-          ┌─────────────┐  ┌─────────────┐
-          │ generating  │  │ generating  │
-          │  (single)   │  │ (multiple)  │
-          └──────┬──────┘  └──────┬──────┘
-                 │                │
-                 └────────┬───────┘
-                          │
-                    script delivered
-                          │
-                          ▼
-                 ┌─────────────┐
-                 │    idle     │ (with last_script populated)
-                 │ (refine or  │
-                 │  new brief) │──── "again" ──► generating (new angle)
-                 └─────────────┘──── "save"  ──► save to library, stay idle
-                                ──── feedback ──► generating (refine)
+                    ┌──────────────────────────────────┐
+                    │                                  │
+                    ▼                                  │
+ ┌──────────┐  brief received   ┌──────────────────┐  │
+ │          │─────────────────▶│  awaiting_format  │  │
+ │   idle   │                  │   (1/2/3 menu)    │  │
+ │          │◀─────────────────└────────┬──────────┘  │
+ └──────┬───┘    cancel/error           │              │
+        │                         format chosen        │
+        │                         (1/2/3)              │
+        │                               │              │
+        │                    ┌──────────▼───────────┐  │
+        │                    │ awaiting_subformat   │  │
+        │                    │ (sub-menu shown)     │  │
+        │                    └──────────┬───────────┘  │
+        │                               │              │
+        │                      subformat chosen        │
+        │                               │              │
+        │                    ┌──────────▼───────────┐  │
+        │                    │     generating       │  │
+        │                    │  (concepts phase)    │──┤
+        │                    └──────────┬───────────┘  │
+        │                               │              │
+        │                      concepts ready          │
+        │                               │              │
+        │                    ┌──────────▼───────────┐  │
+        │                    │   awaiting_concept   │  │
+        │                    │  (1-4 / all menu)    │  │
+        │                    └──────────┬───────────┘  │
+        │                               │              │
+        │                    concept chosen / all       │
+        │                               │              │
+        │                    ┌──────────▼───────────┐  │
+        │                    │     generating       │  │
+        │                    │  (script phase)      │──┘
+        │                    └──────────┬───────────┘
+        │                               │
+        │                      script delivered
+        │                               │
+        │                    ┌──────────▼───────────┐
+        │◀───────────────────│       idle           │
+        │    (returns to     │  (with last_script)  │
+        │     idle with      └──────────┬───────────┘
+        │     script in                 │
+        │     memory)           short text or voice
+        │                       (auto-refine)
+        │                               │
+        │                    ┌──────────▼───────────┐
+        │                    │     generating       │
+        │                    │  (refine phase)      │
+        │                    └──────────┬───────────┘
+        │                               │
+        │                      refined script
+        │                               │
+        └───────────────────────────────┘
 ```
 
-### State Object Schema
+### State Definitions
 
-```json
-{
-  "step": "idle | awaiting_format | awaiting_subformat | generating | awaiting_concept | awaiting_refine",
-  "brief": "Extracted brief text (possibly enriched with web search results)",
-  "format": "immbt | event | collab",
-  "subformat_label": "Full human-readable sub-format label",
-  "last_script": "Most recently generated reel script",
-  "last_caption": "Most recently generated caption",
-  "concepts": ["Concept 1 text", "Concept 2 text", ...],
-  "chosen_concept": "The concept text the user selected"
-}
-```
-
-### Smart Refinement Routing (idle state)
-
-When the state is `idle` and `last_script` exists, the webhook applies heuristic routing:
-
-```python
-brief_signals = ["brand brief", "new brief", "collab brief", "new campaign", "new collab"]
-looks_like_brief = len(msg_body) > 500 or any(s in lower for s in brief_signals)
-```
-
-- **Message > 500 chars** or contains
+| State | Description | Valid Inputs | Transitions To |
+|-------|-------------|-------------|----------------|
+| `idle` | Default state. No active workflow. If `last_script` exists in state, short messages are auto-routed to refinement. | Brief (text/media/voice), greeting, commands (`save`, `again`, `library`, `help`, `cancel`) | `awaiting_format` (brief received), `generating` (again/auto-refine) |
+| `awaiting_format` | Brief captured. Waiting for top-level format selection (1/2/3). | `1` (IMMBT), `2` (Event), `3` (Collab) | `awaiting_subformat` |
+| `awaiting_subformat` | Format selected. Waiting for sub-format selection. | `1`–`5` depending on format | `generating` (triggers concept generation) |
+| `generating` | AI is working in a background thread. Transient state — the user cannot interact meaningfully. | (Incoming messages during this state are handled normally by the webhook but may lead to race conditions) | `awaiting_concept` (concepts ready), `idle` (script delivered or error) |
+| `awaiting_concept` | Concepts presented. Waiting for concept selection. | `1`–`4` (select one), `
